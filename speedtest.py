@@ -12,6 +12,40 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import requests
 
 
+class JsonErrorArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        self._json_mode = False
+        self._command_name = kwargs.pop("command_name", None)
+        super().__init__(*args, **kwargs)
+
+    def set_json_mode(self, enabled: bool, command: str = None):
+        self._json_mode = enabled
+        self._command_name = command
+
+    def error(self, message):
+        if self._json_mode:
+            param = self._extract_param_from_error(message)
+            output_error_json(
+                f"参数错误: {message}",
+                "argument_error",
+                {
+                    "command": self._command_name or "unknown",
+                    "invalid_param": param,
+                    "message": message
+                }
+            )
+        else:
+            super().error(message)
+
+    def _extract_param_from_error(self, message: str) -> Optional[str]:
+        if "argument" in message:
+            parts = message.split("argument")
+            if len(parts) > 1:
+                param_part = parts[1].strip().split(":")[0].strip()
+                return param_part.strip("'\"")
+        return None
+
+
 DEFAULT_SERVERS = [
     {
         "id": "bj-telecom",
@@ -408,15 +442,17 @@ def check_alert_rules(result: Dict, alert_rules: Dict) -> Dict:
             })
 
     if fail_count_threshold is not None:
-        consecutive_fails = 0
-        if not result["test_success"]:
-            consecutive_fails = 1
-            if alert_rules.get("_recent_results"):
-                for prev in reversed(alert_rules["_recent_results"]):
-                    if not prev.get("test_success", True):
-                        consecutive_fails += 1
-                    else:
-                        break
+        consecutive_fails = alert_rules.get("_consecutive_fail_count")
+        if consecutive_fails is None:
+            consecutive_fails = 0
+            if not result["test_success"]:
+                consecutive_fails = 1
+                if alert_rules.get("_recent_results"):
+                    for prev in reversed(alert_rules["_recent_results"]):
+                        if not prev.get("test_success", True):
+                            consecutive_fails += 1
+                        else:
+                            break
         if consecutive_fails >= fail_count_threshold:
             triggered_rules.append({
                 "rule": "consecutive_failures",
@@ -529,6 +565,66 @@ def append_to_jsonl(filepath: str, result: Dict) -> None:
         f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
 
+def load_state(filepath: str) -> Dict:
+    if not os.path.exists(filepath):
+        return {
+            "last_success_time": None,
+            "consecutive_failures": 0,
+            "total_tests": 0,
+            "total_success": 0,
+            "total_failed": 0,
+            "recent_alerts": [],
+            "recent_results": []
+        }
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "last_success_time": None,
+            "consecutive_failures": 0,
+            "total_tests": 0,
+            "total_success": 0,
+            "total_failed": 0,
+            "recent_alerts": [],
+            "recent_results": []
+        }
+
+
+def save_state(filepath: str, state: Dict) -> None:
+    try:
+        state["last_updated"] = datetime.now(timezone.utc).isoformat()
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"保存状态文件失败: {e}", file=sys.stderr)
+
+
+def update_state_with_result(state: Dict, result: Dict, max_recent: int = 10) -> Dict:
+    state["total_tests"] = state.get("total_tests", 0) + 1
+    if result.get("test_success"):
+        state["total_success"] = state.get("total_success", 0) + 1
+        state["consecutive_failures"] = 0
+        state["last_success_time"] = result.get("timestamp")
+    else:
+        state["total_failed"] = state.get("total_failed", 0) + 1
+        state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+
+    recent = state.get("recent_results", [])
+    recent.append(result)
+    state["recent_results"] = recent[-max_recent:]
+
+    if result.get("alert", {}).get("triggered"):
+        alerts = state.get("recent_alerts", [])
+        alerts.append({
+            "timestamp": result.get("timestamp"),
+            "rules": result["alert"]["rules_triggered"]
+        })
+        state["recent_alerts"] = alerts[-max_recent:]
+
+    return state
+
+
 def load_custom_servers(filepath: str) -> Tuple[List[Dict], Optional[str]]:
     if not os.path.exists(filepath):
         return [], f"服务器配置文件不存在: {filepath}"
@@ -593,6 +689,96 @@ def filter_by_time_window(results: List[Dict], start_hours_ago: int, end_hours_a
         except (ValueError, TypeError, AttributeError):
             continue
     return filtered
+
+
+def filter_baseline_window(results: List[Dict], days: int = 7, target_hour: Optional[int] = None) -> List[Dict]:
+    if target_hour is None:
+        target_hour = datetime.now(timezone.utc).hour
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    filtered = []
+    for r in results:
+        try:
+            ts_str = r.get("timestamp")
+            if ts_str.endswith("Z"):
+                ts_str = ts_str[:-1] + "+00:00"
+            ts = datetime.fromisoformat(ts_str)
+            if ts >= start and ts.hour == target_hour:
+                filtered.append(r)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return filtered
+
+
+def compute_baseline(values: List[float]) -> Dict:
+    if not values:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "stddev": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "normal_low": 0.0,
+            "normal_high": 0.0
+        }
+    mean_val = statistics.mean(values)
+    stddev_val = statistics.stdev(values) if len(values) > 1 else 0.0
+    return {
+        "count": len(values),
+        "mean": round(mean_val, 2),
+        "stddev": round(stddev_val, 2),
+        "min": round(min(values), 2),
+        "max": round(max(values), 2),
+        "normal_low": round(mean_val - 2 * stddev_val, 2),
+        "normal_high": round(mean_val + 2 * stddev_val, 2)
+    }
+
+
+def classify_anomaly(value: float, baseline: Dict, is_higher_bad: bool = False) -> Dict:
+    if baseline["count"] == 0:
+        return {"level": "unknown", "deviation_percent": 0.0, "within_normal_range": False}
+
+    mean_val = baseline["mean"]
+    stddev_val = baseline["stddev"]
+
+    if mean_val == 0:
+        deviation_pct = 0.0 if value == 0 else None
+    else:
+        deviation_pct = round(((value - mean_val) / mean_val) * 100, 2)
+
+    normal_low = baseline["normal_low"]
+    normal_high = baseline["normal_high"]
+    within = normal_low <= value <= normal_high
+
+    if stddev_val == 0:
+        level = "normal" if value == mean_val else "mild"
+    else:
+        z_score = abs((value - mean_val) / stddev_val)
+        if z_score < 1:
+            level = "normal"
+        elif z_score < 2:
+            level = "mild"
+        elif z_score < 3:
+            level = "severe"
+        else:
+            level = "critical"
+
+    if is_higher_bad and value > mean_val:
+        pass
+    elif not is_higher_bad and value < mean_val:
+        pass
+    else:
+        if level == "severe":
+            level = "mild"
+        elif level == "critical":
+            level = "severe"
+
+    return {
+        "level": level,
+        "deviation_percent": deviation_pct,
+        "within_normal_range": within,
+        "z_score": round(abs((value - mean_val) / stddev_val), 2) if stddev_val > 0 else None
+    }
 
 
 def compute_summary(results: List[Dict]) -> Dict:
@@ -725,74 +911,96 @@ def analyze_results(results: List[Dict]) -> Dict:
     }
 
 
-def cmd_analyze(args):
-    try:
-        results = read_jsonl(args.input)
-        filtered = filter_by_time_range(results, args.hours)
-        analysis = analyze_results(filtered)
-        print(json.dumps(analysis, ensure_ascii=False, indent=2))
-    except Exception as e:
-        output_error_json(f"分析失败: {e}", "analyze_error")
-
-
-def cmd_compare(args):
+def cmd_baseline(args):
     try:
         results = read_jsonl(args.input)
         if not results:
             output_error_json("JSONL文件为空或不存在", "no_data")
 
-        current_results = filter_by_time_window(results, args.hours, 0)
-        previous_results = filter_by_time_window(results, args.hours * 2, args.hours)
+        target_hour = getattr(args, "hour", None)
+        if target_hour is None:
+            target_hour = datetime.now(timezone.utc).hour
+
+        baseline_days = getattr(args, "baseline_days", 7)
+        compare_hours = getattr(args, "hours", 1)
+
+        baseline_results = filter_baseline_window(results, days=baseline_days, target_hour=target_hour)
+        current_results = filter_by_time_range(results, compare_hours)
+
+        if not baseline_results:
+            output_error_json(f"最近 {baseline_days} 天 {target_hour} 点没有足够的基线数据", "no_baseline_data", {
+                "baseline_days": baseline_days,
+                "target_hour": target_hour,
+                "baseline_count": 0
+            })
+
+        dl_baseline_vals = [r["download"]["speed_mbps"] for r in baseline_results if r.get("download", {}).get("success", False) and r["download"]["speed_mbps"] > 0]
+        ul_baseline_vals = [r["upload"]["speed_mbps"] for r in baseline_results if r.get("upload", {}).get("success", False) and r["upload"]["speed_mbps"] > 0]
+        lat_baseline_vals = [r["latency"]["avg_ms"] for r in baseline_results if r.get("latency", {}).get("success", False) and r["latency"]["avg_ms"] > 0]
+
+        dl_baseline = compute_baseline(dl_baseline_vals)
+        ul_baseline = compute_baseline(ul_baseline_vals)
+        lat_baseline = compute_baseline(lat_baseline_vals)
 
         current_summary = compute_summary(current_results)
-        previous_summary = compute_summary(previous_results)
 
-        comparison = {
-            "comparison_config": {
-                "current_period": f"最近 {args.hours} 小时",
-                "previous_period": f"前 {args.hours} 小时",
-                "hours": args.hours
+        dl_current = current_summary["download"]["avg_mbps"]
+        ul_current = current_summary["upload"]["avg_mbps"]
+        lat_current = current_summary["latency"]["avg_ms"]
+
+        dl_anomaly = classify_anomaly(dl_current, dl_baseline, is_higher_bad=False)
+        ul_anomaly = classify_anomaly(ul_current, ul_baseline, is_higher_bad=False)
+        lat_anomaly = classify_anomaly(lat_current, lat_baseline, is_higher_bad=True)
+
+        overall_level = "normal"
+        levels = ["normal", "mild", "severe", "critical"]
+        for a in [dl_anomaly, ul_anomaly, lat_anomaly]:
+            if a["level"] != "unknown" and levels.index(a["level"]) > levels.index(overall_level):
+                overall_level = a["level"]
+
+        baseline_result = {
+            "baseline_config": {
+                "baseline_days": baseline_days,
+                "target_hour": target_hour,
+                "compare_hours": compare_hours
             },
-            "current_period": current_summary,
-            "previous_period": previous_summary,
-            "changes": {
-                "download_speed": calc_change(
-                    current_summary["download"]["avg_mbps"],
-                    previous_summary["download"]["avg_mbps"]
-                ),
-                "upload_speed": calc_change(
-                    current_summary["upload"]["avg_mbps"],
-                    previous_summary["upload"]["avg_mbps"]
-                ),
-                "latency": calc_change(
-                    current_summary["latency"]["avg_ms"],
-                    previous_summary["latency"]["avg_ms"]
-                ),
-                "success_rate": calc_change(
-                    current_summary["success_rate"],
-                    previous_summary["success_rate"]
-                )
+            "baseline": {
+                "sample_count": len(baseline_results),
+                "download": dl_baseline,
+                "upload": ul_baseline,
+                "latency": lat_baseline
             },
-            "quality_change": compare_quality_distributions(
-                current_summary["quality_distribution"],
-                previous_summary["quality_distribution"]
-            )
+            "current": {
+                "sample_count": len(current_results),
+                "download_avg_mbps": dl_current,
+                "upload_avg_mbps": ul_current,
+                "latency_avg_ms": lat_current
+            },
+            "anomaly": {
+                "overall_level": overall_level,
+                "download": dl_anomaly,
+                "upload": ul_anomaly,
+                "latency": lat_anomaly
+            }
         }
 
-        alerts = []
-        dl_change = comparison["changes"]["download_speed"]
-        lat_change = comparison["changes"]["latency"]
-        if dl_change["direction"] == "decreased" and dl_change["percentage"] is not None and dl_change["percentage"] < -30:
-            alerts.append(f"下载速度下降 {abs(dl_change['percentage'])}%")
-        if lat_change["direction"] == "increased" and lat_change["percentage"] is not None and lat_change["percentage"] > 50:
-            alerts.append(f"延迟上升 {lat_change['percentage']}%")
-        if current_summary["success_rate"] < 80:
-            alerts.append(f"当前时段成功率仅 {current_summary['success_rate']}%")
-
-        comparison["alerts"] = alerts
-        print(json.dumps(comparison, ensure_ascii=False, indent=2))
+        fmt = getattr(args, "fmt", "full")
+        output = _format_output(baseline_result, fmt)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
     except Exception as e:
-        output_error_json(f"对比分析失败: {e}", "compare_error")
+        output_error_json(f"基线分析失败: {e}", "baseline_error")
+
+
+def cmd_analyze(args):
+    try:
+        results = read_jsonl(args.input)
+        filtered = filter_by_time_range(results, args.hours)
+        analysis = analyze_results(filtered)
+        fmt = getattr(args, "fmt", "full")
+        output = _format_output(analysis, fmt)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    except Exception as e:
+        output_error_json(f"分析失败: {e}", "analyze_error")
 
 
 def resolve_servers(args) -> Tuple[List[Dict], Optional[str]]:
@@ -882,6 +1090,9 @@ def cmd_test(args):
                 "tags_requested": getattr(args, "tags", None)
             })
 
+        state_file = getattr(args, "state_file", None)
+        state = load_state(state_file) if state_file else None
+
         if not getattr(args, "json", False):
             print(f"测试服务器: {selected_server['name']}", file=sys.stderr)
             if selected_server.get("region"):
@@ -895,6 +1106,9 @@ def cmd_test(args):
             print(f"下载地址: {build_download_url(selected_server, getattr(args, 'download_size', None))}", file=sys.stderr)
             if selected_server.get("upload_url") and not getattr(args, "skip_upload", False):
                 print(f"上传地址: {selected_server.get('upload_url')}", file=sys.stderr)
+            if state_file and state:
+                print(f"状态文件: {state_file}", file=sys.stderr)
+                print(f"历史测试: {state.get('total_tests', 0)} 次, 连续失败: {state.get('consecutive_failures', 0)} 次", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
 
         alert_rules = {}
@@ -904,9 +1118,7 @@ def cmd_test(args):
             alert_rules["latency_max_ms"] = args.alert_latency_max
         if getattr(args, "alert_consecutive_fail", None) is not None:
             alert_rules["consecutive_fail"] = args.alert_consecutive_fail
-        alert_rules["_recent_results"] = []
-
-        consecutive_fail_count = 0
+        alert_rules["_recent_results"] = state.get("recent_results", []) if state else []
 
         while True:
             result = run_test(
@@ -920,6 +1132,12 @@ def cmd_test(args):
             )
 
             if alert_rules:
+                consecutive_fail_count = state.get("consecutive_failures", 0) if state else 0
+                if not result["test_success"]:
+                    consecutive_fail_count += 1
+                else:
+                    consecutive_fail_count = 0
+                alert_rules["_consecutive_fail_count"] = consecutive_fail_count
                 alert_result = check_alert_rules(result, alert_rules)
                 result["alert"] = alert_result
                 if alert_result["triggered"]:
@@ -927,12 +1145,19 @@ def cmd_test(args):
                         for rule in alert_result["rules_triggered"]:
                             print(f"⚠ 告警: {rule['message']}", file=sys.stderr)
 
-            if alert_rules.get("consecutive_fail") is not None:
-                if not result["test_success"]:
-                    consecutive_fail_count += 1
-                else:
-                    consecutive_fail_count = 0
-                alert_rules["_recent_results"] = alert_rules["_recent_results"][-9:] + [result]
+            if state is not None:
+                state = update_state_with_result(state, result)
+                if state_file:
+                    save_state(state_file, state)
+                result["state_snapshot"] = {
+                    "total_tests": state.get("total_tests", 0),
+                    "total_success": state.get("total_success", 0),
+                    "total_failed": state.get("total_failed", 0),
+                    "consecutive_failures": state.get("consecutive_failures", 0),
+                    "last_success_time": state.get("last_success_time")
+                }
+            else:
+                result["state_snapshot"] = None
 
             if args.output:
                 append_to_jsonl(args.output, result)
@@ -971,6 +1196,9 @@ def cmd_test(args):
                     print(f"告警状态: 已触发 ({len(result['alert']['rules_triggered'])} 条规则)", file=sys.stderr)
                     for rule in result['alert']['rules_triggered']:
                         print(f"  → {rule['message']}", file=sys.stderr)
+                if result.get("state_snapshot"):
+                    ss = result["state_snapshot"]
+                    print(f"累计状态: 共 {ss['total_tests']} 次, 成功 {ss['total_success']} 次, 连续失败 {ss['consecutive_failures']} 次", file=sys.stderr)
 
             if not getattr(args, "continuous", False):
                 break
@@ -1003,45 +1231,210 @@ def add_test_arguments(parser):
     parser.add_argument("--output", type=str, help="JSONL输出文件路径，用于保存连续测试结果")
     parser.add_argument("--webhook", type=str, help="测试结果Webhook推送地址")
     parser.add_argument("--json", action="store_true", help="仅输出JSON格式结果")
+    parser.add_argument("--state-file", type=str, help="状态文件路径，用于记录累计测试状态，程序重启后可恢复")
     parser.add_argument("--alert-download-min", type=float, help="告警：下载速度低于此值(Mbps)触发")
     parser.add_argument("--alert-latency-max", type=float, help="告警：延迟高于此值(ms)触发")
     parser.add_argument("--alert-consecutive-fail", type=int, help="告警：连续失败达到此次数触发")
 
 
+def _detect_json_mode() -> bool:
+    return "--json" in sys.argv[1:]
+
+
+def _detect_subcommand() -> Optional[str]:
+    subcommands = {"test", "analyze", "compare", "baseline"}
+    for arg in sys.argv[1:]:
+        if not arg.startswith("-"):
+            return arg if arg in subcommands else None
+    return None
+
+
+def _format_output(data: Dict, fmt: str) -> Dict:
+    if fmt == "full":
+        return data
+    if fmt == "summary":
+        return _extract_summary(data)
+    return data
+
+
+def _extract_summary(data: Dict) -> Dict:
+    if "summary" in data and "total_tests" in data:
+        summary = data.get("summary", {})
+        server_dist = data.get("server_distribution", {})
+        worst_server = None
+        worst_pct = 0
+        for name, info in server_dist.items():
+            if info.get("percentage", 0) > worst_pct:
+                worst_pct = info["percentage"]
+                worst_server = name
+        return {
+            "total_tests": data.get("total_tests", 0),
+            "success_rate": summary.get("success_rate", 0.0),
+            "download_avg_mbps": summary.get("download", {}).get("avg_mbps", 0.0),
+            "download_min_mbps": summary.get("download", {}).get("min_mbps", 0.0),
+            "upload_avg_mbps": summary.get("upload", {}).get("avg_mbps", 0.0),
+            "latency_avg_ms": summary.get("latency", {}).get("avg_ms", 0.0),
+            "latency_max_ms": summary.get("latency", {}).get("max_ms", 0.0),
+            "alert_count": data.get("alert_count", 0) if "alert_count" in data else None,
+            "worst_server": worst_server,
+            "time_range": data.get("time_range")
+        }
+    if "changes" in data and "current_period" in data:
+        alerts = data.get("alerts", [])
+        return {
+            "hours": data.get("comparison_config", {}).get("hours", 0),
+            "current": {
+                "download_avg_mbps": data.get("current_period", {}).get("download", {}).get("avg_mbps", 0.0),
+                "upload_avg_mbps": data.get("current_period", {}).get("upload", {}).get("avg_mbps", 0.0),
+                "latency_avg_ms": data.get("current_period", {}).get("latency", {}).get("avg_ms", 0.0),
+                "success_rate": data.get("current_period", {}).get("success_rate", 0.0)
+            },
+            "changes": {
+                "download_speed": data.get("changes", {}).get("download_speed", {}),
+                "upload_speed": data.get("changes", {}).get("upload_speed", {}),
+                "latency": data.get("changes", {}).get("latency", {}),
+                "success_rate": data.get("changes", {}).get("success_rate", {})
+            },
+            "alert_count": len(alerts),
+            "alerts": alerts
+        }
+    if "anomaly" in data and "baseline" in data:
+        return {
+            "baseline_days": data.get("baseline_config", {}).get("baseline_days", 0),
+            "target_hour": data.get("baseline_config", {}).get("target_hour", 0),
+            "baseline_sample_count": data.get("baseline", {}).get("sample_count", 0),
+            "current_sample_count": data.get("current", {}).get("sample_count", 0),
+            "overall_anomaly_level": data.get("anomaly", {}).get("overall_level", "unknown"),
+            "download": {
+                "baseline_mean": data.get("baseline", {}).get("download", {}).get("mean", 0.0),
+                "current": data.get("current", {}).get("download_avg_mbps", 0.0),
+                "anomaly_level": data.get("anomaly", {}).get("download", {}).get("level", "unknown"),
+                "deviation_percent": data.get("anomaly", {}).get("download", {}).get("deviation_percent", 0.0)
+            },
+            "latency": {
+                "baseline_mean": data.get("baseline", {}).get("latency", {}).get("mean", 0.0),
+                "current": data.get("current", {}).get("latency_avg_ms", 0.0),
+                "anomaly_level": data.get("anomaly", {}).get("latency", {}).get("level", "unknown"),
+                "deviation_percent": data.get("anomaly", {}).get("latency", {}).get("deviation_percent", 0.0)
+            }
+        }
+    return data
+
+
 def main():
-    parser = argparse.ArgumentParser(description="网速测试工具 - 输出结构化JSON数据")
+    json_mode = _detect_json_mode()
+    subcmd = _detect_subcommand()
+
+    parser = JsonErrorArgumentParser(description="网速测试工具 - 输出结构化JSON数据")
+    parser.set_json_mode(json_mode, subcmd)
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
     test_parser = subparsers.add_parser("test", help="执行网速测试")
+    test_parser.set_json_mode(json_mode, "test")
     add_test_arguments(test_parser)
 
     analyze_parser = subparsers.add_parser("analyze", help="分析历史JSONL数据")
+    analyze_parser.set_json_mode(json_mode, "analyze")
     analyze_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
     analyze_parser.add_argument("--hours", type=int, default=0, help="统计最近N小时的数据，0表示全部数据")
+    analyze_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
 
     compare_parser = subparsers.add_parser("compare", help="对比两个时段的网络质量变化")
+    compare_parser.set_json_mode(json_mode, "compare")
     compare_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
     compare_parser.add_argument("--hours", type=int, default=1, help="对比时段长度(小时)，默认1小时(即最近1h vs 前1h)")
+    compare_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
 
-    default_parser = argparse.ArgumentParser(description="网速测试工具 - 输出结构化JSON数据", add_help=False)
+    baseline_parser = subparsers.add_parser("baseline", help="基于历史基线检测异常")
+    baseline_parser.set_json_mode(json_mode, "baseline")
+    baseline_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
+    baseline_parser.add_argument("--baseline-days", type=int, default=7, help="基线数据天数，默认7天")
+    baseline_parser.add_argument("--hour", type=int, help="目标小时(0-23)，默认当前小时")
+    baseline_parser.add_argument("--hours", type=int, default=1, help="待检测时段长度(小时)，默认1小时")
+    baseline_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
+
+    default_parser = JsonErrorArgumentParser(description="网速测试工具 - 输出结构化JSON数据", add_help=False)
+    default_parser.set_json_mode(json_mode, "test")
     default_parser.add_argument("command", nargs="?", default=None)
     add_test_arguments(default_parser)
 
-    first_arg = sys.argv[1] if len(sys.argv) > 1 else None
-    subcommands = {"test", "analyze", "compare"}
-
-    if first_arg in subcommands:
+    if subcmd:
         args = parser.parse_args()
         if args.command == "analyze":
             cmd_analyze(args)
         elif args.command == "compare":
             cmd_compare(args)
+        elif args.command == "baseline":
+            cmd_baseline(args)
         else:
             cmd_test(args)
     else:
         default_args = default_parser.parse_args(sys.argv[1:])
         default_args.command = "test"
         cmd_test(default_args)
+
+
+def cmd_compare(args):
+    try:
+        results = read_jsonl(args.input)
+        if not results:
+            output_error_json("JSONL文件为空或不存在", "no_data")
+
+        current_results = filter_by_time_window(results, args.hours, 0)
+        previous_results = filter_by_time_window(results, args.hours * 2, args.hours)
+
+        current_summary = compute_summary(current_results)
+        previous_summary = compute_summary(previous_results)
+
+        comparison = {
+            "comparison_config": {
+                "current_period": f"最近 {args.hours} 小时",
+                "previous_period": f"前 {args.hours} 小时",
+                "hours": args.hours
+            },
+            "current_period": current_summary,
+            "previous_period": previous_summary,
+            "changes": {
+                "download_speed": calc_change(
+                    current_summary["download"]["avg_mbps"],
+                    previous_summary["download"]["avg_mbps"]
+                ),
+                "upload_speed": calc_change(
+                    current_summary["upload"]["avg_mbps"],
+                    previous_summary["upload"]["avg_mbps"]
+                ),
+                "latency": calc_change(
+                    current_summary["latency"]["avg_ms"],
+                    previous_summary["latency"]["avg_ms"]
+                ),
+                "success_rate": calc_change(
+                    current_summary["success_rate"],
+                    previous_summary["success_rate"]
+                )
+            },
+            "quality_change": compare_quality_distributions(
+                current_summary["quality_distribution"],
+                previous_summary["quality_distribution"]
+            )
+        }
+
+        alerts = []
+        dl_change = comparison["changes"]["download_speed"]
+        lat_change = comparison["changes"]["latency"]
+        if dl_change["direction"] == "decreased" and dl_change["percentage"] is not None and dl_change["percentage"] < -30:
+            alerts.append(f"下载速度下降 {abs(dl_change['percentage'])}%")
+        if lat_change["direction"] == "increased" and lat_change["percentage"] is not None and lat_change["percentage"] > 50:
+            alerts.append(f"延迟上升 {lat_change['percentage']}%")
+        if current_summary["success_rate"] < 80:
+            alerts.append(f"当前时段成功率仅 {current_summary['success_rate']}%")
+
+        comparison["alerts"] = alerts
+
+        fmt = getattr(args, "fmt", "full")
+        output = _format_output(comparison, fmt)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    except Exception as e:
+        output_error_json(f"对比分析失败: {e}", "compare_error")
 
 
 if __name__ == "__main__":
