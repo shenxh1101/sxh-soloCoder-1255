@@ -125,17 +125,151 @@ DEFAULT_SERVERS = [
 ]
 
 
-def output_error_json(message: str, error_type: str = "error", details: Optional[Dict] = None) -> None:
+def output_error_json(message: str, error_type: str = "error", details: Optional[Dict] = None,
+                      invalid_param: str = None) -> None:
     error_result = {
         "success": False,
         "error": error_type,
         "message": message,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
-    if details:
-        error_result["details"] = details
+    det = details or {}
+    if invalid_param and "invalid_param" not in det:
+        det["invalid_param"] = invalid_param
+    if det:
+        error_result["details"] = det
     print(json.dumps(error_result, ensure_ascii=False, indent=2))
     sys.exit(1)
+
+
+def positive_int(value: str) -> int:
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"必须是整数，当前值: {value}")
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"不能为负数，当前值: {ivalue}")
+    return ivalue
+
+
+def positive_float(value: str) -> float:
+    try:
+        fvalue = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"必须是数字，当前值: {value}")
+    if fvalue < 0:
+        raise argparse.ArgumentTypeError(f"不能为负数，当前值: {fvalue}")
+    return fvalue
+
+
+def hour_range(value: str) -> int:
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"必须是整数，当前值: {value}")
+    if ivalue < 0 or ivalue > 23:
+        raise argparse.ArgumentTypeError(f"小时必须在 0-23 之间，当前值: {ivalue}")
+    return ivalue
+
+
+DEFAULT_ALERT_RULES = {
+    "rules": {
+        "download": {
+            "enabled": True,
+            "warning": {"min_mbps": 50},
+            "critical": {"min_mbps": 20}
+        },
+        "upload": {
+            "enabled": True,
+            "warning": {"min_mbps": 20},
+            "critical": {"min_mbps": 5}
+        },
+        "latency": {
+            "enabled": True,
+            "warning": {"max_ms": 80},
+            "critical": {"max_ms": 150}
+        },
+        "packet_loss": {
+            "enabled": True,
+            "warning": {"max_percent": 5},
+            "critical": {"max_percent": 20}
+        },
+        "success_rate": {
+            "enabled": True,
+            "window_minutes": 60,
+            "warning": {"min_percent": 90},
+            "critical": {"min_percent": 70}
+        },
+        "anomaly_level": {
+            "enabled": False,
+            "warning": {"levels": ["mild"]},
+            "critical": {"levels": ["severe", "critical"]}
+        },
+        "consecutive_fail": {
+            "enabled": False,
+            "warning": {"count": 2},
+            "critical": {"count": 5}
+        }
+    }
+}
+
+
+def load_alert_rules(filepath: Optional[str]) -> Tuple[Dict, Optional[str]]:
+    if not filepath:
+        return DEFAULT_ALERT_RULES, None
+    if not os.path.exists(filepath):
+        return DEFAULT_ALERT_RULES, f"告警配置文件不存在: {filepath}，使用默认规则"
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rules = data.get("rules", {})
+        merged = {"rules": {**DEFAULT_ALERT_RULES["rules"], **rules}}
+        return merged, None
+    except json.JSONDecodeError as e:
+        return DEFAULT_ALERT_RULES, f"告警配置文件JSON格式错误: {e}，使用默认规则"
+    except Exception as e:
+        return DEFAULT_ALERT_RULES, f"读取告警配置文件失败: {e}，使用默认规则"
+
+
+def _check_threshold_hit(rule_cfg: Dict, current_value: float,
+                         metric_name: str, unit: str,
+                         is_higher_bad: bool) -> List[Dict]:
+    hits = []
+    if not rule_cfg.get("enabled", True):
+        return hits
+    for severity in ["warning", "critical"]:
+        svr_cfg = rule_cfg.get(severity)
+        if not svr_cfg:
+            continue
+        if is_higher_bad:
+            if "max_ms" in svr_cfg:
+                max_val, key = svr_cfg["max_ms"], "max_ms"
+            elif "max_percent" in svr_cfg:
+                max_val, key = svr_cfg["max_percent"], "max_percent"
+            else:
+                continue
+            if current_value > max_val:
+                hits.append({
+                    "rule": metric_name, "severity": severity,
+                    "threshold": max_val, "actual": round(current_value, 2),
+                    "metric_key": key,
+                    "message": f"{metric_name} {current_value:.2f} {unit} 超过 {severity} 阈值 {max_val}"
+                })
+        else:
+            if "min_mbps" in svr_cfg:
+                min_val, key = svr_cfg["min_mbps"], "min_mbps"
+            elif "min_percent" in svr_cfg:
+                min_val, key = svr_cfg["min_percent"], "min_percent"
+            else:
+                continue
+            if current_value < min_val:
+                hits.append({
+                    "rule": metric_name, "severity": severity,
+                    "threshold": min_val, "actual": round(current_value, 2),
+                    "metric_key": key,
+                    "message": f"{metric_name} {current_value:.2f} {unit} 低于 {severity} 阈值 {min_val}"
+                })
+    return hits
 
 
 def build_download_url(server: Dict, size_mb: Optional[int] = None) -> str:
@@ -414,55 +548,76 @@ def evaluate_network_quality(download_mbps: float, upload_mbps: float, latency_m
     return quality, suggestion.strip()
 
 
-def check_alert_rules(result: Dict, alert_rules: Dict) -> Dict:
-    if not alert_rules:
-        return {"triggered": False, "rules_triggered": []}
-
+def check_alert_rules(result: Dict, alert_rules: Dict, context: Optional[Dict] = None) -> Dict:
+    rules = alert_rules.get("rules", {})
     triggered_rules = []
-    download_threshold = alert_rules.get("download_min_mbps")
-    latency_threshold = alert_rules.get("latency_max_ms")
-    fail_count_threshold = alert_rules.get("consecutive_fail")
 
-    if download_threshold is not None and result["download"]["success"]:
-        if result["download"]["speed_mbps"] < download_threshold:
-            triggered_rules.append({
-                "rule": "download_below_threshold",
-                "threshold_mbps": download_threshold,
-                "actual_mbps": result["download"]["speed_mbps"],
-                "message": f"下载速度 {result['download']['speed_mbps']:.2f} Mbps 低于阈值 {download_threshold} Mbps"
-            })
+    if result["download"]["success"] and rules.get("download", {}).get("enabled", True):
+        triggered_rules.extend(_check_threshold_hit(
+            rules["download"], result["download"]["speed_mbps"], "download_speed", "Mbps", is_higher_bad=False
+        ))
 
-    if latency_threshold is not None and result["latency"]["success"]:
-        if result["latency"]["avg_ms"] > latency_threshold:
-            triggered_rules.append({
-                "rule": "latency_above_threshold",
-                "threshold_ms": latency_threshold,
-                "actual_ms": result["latency"]["avg_ms"],
-                "message": f"延迟 {result['latency']['avg_ms']:.2f} ms 超过阈值 {latency_threshold} ms"
-            })
+    if result["upload"]["success"] and rules.get("upload", {}).get("enabled", True):
+        triggered_rules.extend(_check_threshold_hit(
+            rules["upload"], result["upload"]["speed_mbps"], "upload_speed", "Mbps", is_higher_bad=False
+        ))
 
-    if fail_count_threshold is not None:
-        consecutive_fails = alert_rules.get("_consecutive_fail_count")
-        if consecutive_fails is None:
-            consecutive_fails = 0
-            if not result["test_success"]:
-                consecutive_fails = 1
-                if alert_rules.get("_recent_results"):
-                    for prev in reversed(alert_rules["_recent_results"]):
-                        if not prev.get("test_success", True):
-                            consecutive_fails += 1
-                        else:
-                            break
-        if consecutive_fails >= fail_count_threshold:
-            triggered_rules.append({
-                "rule": "consecutive_failures",
-                "threshold_count": fail_count_threshold,
-                "actual_count": consecutive_fails,
-                "message": f"连续测试失败 {consecutive_fails} 次，达到阈值 {fail_count_threshold} 次"
-            })
+    if result["latency"]["success"] and rules.get("latency", {}).get("enabled", True):
+        triggered_rules.extend(_check_threshold_hit(
+            rules["latency"], result["latency"]["avg_ms"], "latency", "ms", is_higher_bad=True
+        ))
+
+    if result["latency"]["success"] and rules.get("packet_loss", {}).get("enabled", True):
+        triggered_rules.extend(_check_threshold_hit(
+            rules["packet_loss"], result["latency"]["packet_loss"], "packet_loss", "%", is_higher_bad=True
+        ))
+
+    if rules.get("anomaly_level", {}).get("enabled", False) and context and "anomaly_level" in context:
+        anomaly_cfg = rules["anomaly_level"]
+        current_level = context["anomaly_level"]
+        for severity in ["warning", "critical"]:
+            svr_cfg = anomaly_cfg.get(severity, {})
+            levels = svr_cfg.get("levels", [])
+            if current_level in levels:
+                triggered_rules.append({
+                    "rule": "anomaly_level", "severity": severity,
+                    "threshold": levels, "actual": current_level,
+                    "message": f"基线异常等级 {current_level} 命中 {severity} 规则"
+                })
+
+    if rules.get("consecutive_fail", {}).get("enabled", False):
+        consec_cfg = rules["consecutive_fail"]
+        ctx = context or {}
+        consecutive_fails = ctx.get("consecutive_failures", 0 if result["test_success"] else 1)
+        for severity in ["warning", "critical"]:
+            svr_cfg = consec_cfg.get(severity, {})
+            count = svr_cfg.get("count")
+            if count and consecutive_fails >= count:
+                triggered_rules.append({
+                    "rule": "consecutive_fail", "severity": severity,
+                    "threshold": count, "actual": consecutive_fails,
+                    "message": f"连续测试失败 {consecutive_fails} 次，达到 {severity} 阈值 {count}"
+                })
+
+    if rules.get("success_rate", {}).get("enabled", False) and context:
+        sr_cfg = rules["success_rate"]
+        window_sr = context.get("window_success_rate")
+        if window_sr is not None:
+            triggered_rules.extend(_check_threshold_hit(
+                sr_cfg, window_sr, "success_rate", "%", is_higher_bad=False
+            ))
+
+    highest_severity = "none"
+    severity_order = {"none": 0, "warning": 1, "critical": 2}
+    for hit in triggered_rules:
+        if severity_order.get(hit["severity"], 0) > severity_order.get(highest_severity, 0):
+            highest_severity = hit["severity"]
 
     return {
         "triggered": len(triggered_rules) > 0,
+        "highest_severity": highest_severity,
+        "warning_count": sum(1 for r in triggered_rules if r["severity"] == "warning"),
+        "critical_count": sum(1 for r in triggered_rules if r["severity"] == "critical"),
         "rules_triggered": triggered_rules
     }
 
@@ -553,6 +708,9 @@ def run_test(server: Dict, upload_size_mb: int = 10, download_size_mb: Optional[
         },
         "alert": {
             "triggered": False,
+            "highest_severity": "none",
+            "warning_count": 0,
+            "critical_count": 0,
             "rules_triggered": []
         }
     }
@@ -655,61 +813,6 @@ def read_jsonl(filepath: str) -> List[Dict]:
     return results
 
 
-def filter_by_time_range(results: List[Dict], hours: int) -> List[Dict]:
-    if hours <= 0:
-        return results
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    filtered = []
-    for r in results:
-        try:
-            ts_str = r.get("timestamp")
-            if ts_str.endswith("Z"):
-                ts_str = ts_str[:-1] + "+00:00"
-            ts = datetime.fromisoformat(ts_str)
-            if ts >= cutoff:
-                filtered.append(r)
-        except (ValueError, TypeError, AttributeError):
-            continue
-    return filtered
-
-
-def filter_by_time_window(results: List[Dict], start_hours_ago: int, end_hours_ago: int) -> List[Dict]:
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=start_hours_ago)
-    end = now - timedelta(hours=end_hours_ago)
-    filtered = []
-    for r in results:
-        try:
-            ts_str = r.get("timestamp")
-            if ts_str.endswith("Z"):
-                ts_str = ts_str[:-1] + "+00:00"
-            ts = datetime.fromisoformat(ts_str)
-            if start <= ts <= end:
-                filtered.append(r)
-        except (ValueError, TypeError, AttributeError):
-            continue
-    return filtered
-
-
-def filter_baseline_window(results: List[Dict], days: int = 7, target_hour: Optional[int] = None) -> List[Dict]:
-    if target_hour is None:
-        target_hour = datetime.now(timezone.utc).hour
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
-    filtered = []
-    for r in results:
-        try:
-            ts_str = r.get("timestamp")
-            if ts_str.endswith("Z"):
-                ts_str = ts_str[:-1] + "+00:00"
-            ts = datetime.fromisoformat(ts_str)
-            if ts >= start and ts.hour == target_hour:
-                filtered.append(r)
-        except (ValueError, TypeError, AttributeError):
-            continue
-    return filtered
-
-
 def compute_baseline(values: List[float]) -> Dict:
     if not values:
         return {
@@ -781,51 +884,151 @@ def classify_anomaly(value: float, baseline: Dict, is_higher_bad: bool = False) 
     }
 
 
+def parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
+    if not ts_str:
+        return None
+    try:
+        if ts_str.endswith("Z"):
+            ts_str = ts_str[:-1] + "+00:00"
+        return datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def filter_results(results: List[Dict], server_name: Optional[str] = None,
+                   tags: Optional[List[str]] = None) -> List[Dict]:
+    filtered = results
+    if server_name:
+        filtered = [r for r in filtered if r.get("server", {}).get("name") == server_name]
+    if tags:
+        filtered = [r for r in filtered if any(t in r.get("server", {}).get("tags", []) for t in tags)]
+    return filtered
+
+
 def compute_summary(results: List[Dict]) -> Dict:
+    empty_dl = {"count": 0, "avg_mbps": 0.0, "min_mbps": 0.0, "max_mbps": 0.0, "median_mbps": 0.0}
+    empty_ul = {"count": 0, "avg_mbps": 0.0, "min_mbps": 0.0, "max_mbps": 0.0, "median_mbps": 0.0}
+    empty_lt = {"count": 0, "avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "median_ms": 0.0}
     if not results:
-        return {
-            "count": 0,
-            "download": {"avg_mbps": 0.0, "min_mbps": 0.0, "max_mbps": 0.0, "median_mbps": 0.0},
-            "upload": {"avg_mbps": 0.0, "min_mbps": 0.0, "max_mbps": 0.0, "median_mbps": 0.0},
-            "latency": {"avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "median_ms": 0.0},
-            "success_rate": 0.0,
-            "quality_distribution": {}
-        }
+        return {"count": 0, "download": empty_dl.copy(), "upload": empty_ul.copy(), "latency": empty_lt.copy(),
+                "success_rate": 0.0, "quality_distribution": {},
+                "alert_count": 0, "warning_count": 0, "critical_count": 0}
 
-    download_speeds = [r["download"]["speed_mbps"] for r in results if r.get("download", {}).get("success", False) and r["download"]["speed_mbps"] > 0]
-    upload_speeds = [r["upload"]["speed_mbps"] for r in results if r.get("upload", {}).get("success", False) and r["upload"]["speed_mbps"] > 0]
-    latencies = [r["latency"]["avg_ms"] for r in results if r.get("latency", {}).get("success", False) and r["latency"]["avg_ms"] > 0]
+    dls = [r["download"]["speed_mbps"] for r in results if r.get("download", {}).get("success", False) and r["download"]["speed_mbps"] > 0]
+    uls = [r["upload"]["speed_mbps"] for r in results if r.get("upload", {}).get("success", False) and r["upload"]["speed_mbps"] > 0]
+    lats = [r["latency"]["avg_ms"] for r in results if r.get("latency", {}).get("success", False) and r["latency"]["avg_ms"] > 0]
 
-    quality_counts: Dict[str, int] = {}
+    qc: Dict[str, int] = {}
     for r in results:
         q = r.get("quality_evaluation", {}).get("quality", "未知")
-        quality_counts[q] = quality_counts.get(q, 0) + 1
+        qc[q] = qc.get(q, 0) + 1
 
-    success_count = sum(1 for r in results if r.get("test_success", False))
+    sc = sum(1 for r in results if r.get("test_success", False))
+    ac = sum(1 for r in results if r.get("alert", {}).get("triggered", False))
+    wc = sum(r.get("alert", {}).get("warning_count", 0) for r in results)
+    cc = sum(r.get("alert", {}).get("critical_count", 0) for r in results)
 
     return {
         "count": len(results),
-        "download": {
-            "avg_mbps": round(statistics.mean(download_speeds), 2) if download_speeds else 0.0,
-            "min_mbps": round(min(download_speeds), 2) if download_speeds else 0.0,
-            "max_mbps": round(max(download_speeds), 2) if download_speeds else 0.0,
-            "median_mbps": round(statistics.median(download_speeds), 2) if download_speeds else 0.0
-        },
-        "upload": {
-            "avg_mbps": round(statistics.mean(upload_speeds), 2) if upload_speeds else 0.0,
-            "min_mbps": round(min(upload_speeds), 2) if upload_speeds else 0.0,
-            "max_mbps": round(max(upload_speeds), 2) if upload_speeds else 0.0,
-            "median_mbps": round(statistics.median(upload_speeds), 2) if upload_speeds else 0.0
-        },
-        "latency": {
-            "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
-            "min_ms": round(min(latencies), 2) if latencies else 0.0,
-            "max_ms": round(max(latencies), 2) if latencies else 0.0,
-            "median_ms": round(statistics.median(latencies), 2) if latencies else 0.0
-        },
-        "success_rate": round(success_count / len(results) * 100, 1) if results else 0.0,
-        "quality_distribution": quality_counts
+        "download": {"count": len(dls),
+                     "avg_mbps": round(statistics.mean(dls), 2) if dls else 0.0,
+                     "min_mbps": round(min(dls), 2) if dls else 0.0,
+                     "max_mbps": round(max(dls), 2) if dls else 0.0,
+                     "median_mbps": round(statistics.median(dls), 2) if dls else 0.0},
+        "upload": {"count": len(uls),
+                   "avg_mbps": round(statistics.mean(uls), 2) if uls else 0.0,
+                   "min_mbps": round(min(uls), 2) if uls else 0.0,
+                   "max_mbps": round(max(uls), 2) if uls else 0.0,
+                   "median_mbps": round(statistics.median(uls), 2) if uls else 0.0},
+        "latency": {"count": len(lats),
+                    "avg_ms": round(statistics.mean(lats), 2) if lats else 0.0,
+                    "min_ms": round(min(lats), 2) if lats else 0.0,
+                    "max_ms": round(max(lats), 2) if lats else 0.0,
+                    "median_ms": round(statistics.median(lats), 2) if lats else 0.0},
+        "success_rate": round(sc / len(results) * 100, 1),
+        "quality_distribution": qc,
+        "alert_count": ac,
+        "warning_count": wc,
+        "critical_count": cc
     }
+
+
+def compute_worst_server(results: List[Dict]) -> Optional[Dict]:
+    if not results:
+        return None
+    by_server: Dict[str, List[Dict]] = {}
+    for r in results:
+        name = r.get("server", {}).get("name", "未知")
+        by_server.setdefault(name, []).append(r)
+    scored = []
+    for name, rs in by_server.items():
+        sc = sum(1 for r in rs if r.get("test_success", False))
+        fr = round((1 - sc / len(rs)) * 100, 2)
+        dls = [r["download"]["speed_mbps"] for r in rs if r.get("download", {}).get("success", False) and r["download"]["speed_mbps"] > 0]
+        avg_dl = statistics.mean(dls) if dls else 0
+        lats = [r["latency"]["avg_ms"] for r in rs if r.get("latency", {}).get("success", False) and r["latency"]["avg_ms"] > 0]
+        avg_lat = statistics.mean(lats) if lats else 0
+        cc = sum(r.get("alert", {}).get("critical_count", 0) for r in rs)
+        wc = sum(r.get("alert", {}).get("warning_count", 0) for r in rs)
+        score = fr * 2 + max(0, 50 - avg_dl) * 1 + avg_lat * 0.5 + cc * 20 + wc * 5
+        scored.append({"name": name, "test_count": len(rs), "failure_rate": fr,
+                       "avg_download_mbps": round(avg_dl, 2), "avg_latency_ms": round(avg_lat, 2),
+                       "critical_count": cc, "warning_count": wc,
+                       "composite_score": round(score, 2)})
+    scored.sort(key=lambda x: x["composite_score"], reverse=True)
+    return scored[0] if scored else None
+
+
+def aggregate_by_period(results: List[Dict], period: str) -> List[Dict]:
+    buckets: Dict[str, List[Dict]] = {}
+    for r in results:
+        ts = parse_ts(r.get("timestamp"))
+        if not ts:
+            continue
+        if period == "day":
+            key = ts.strftime("%Y-%m-%d")
+        else:
+            key = ts.strftime("%Y-%m-%d %H:00")
+        buckets.setdefault(key, []).append(r)
+    aggregated = []
+    for key in sorted(buckets.keys()):
+        rs = buckets[key]
+        s = compute_summary(rs)
+        aggregated.append({
+            "period": key,
+            "test_count": s["count"],
+            "success_rate": s["success_rate"],
+            "download_avg_mbps": s["download"]["avg_mbps"],
+            "download_min_mbps": s["download"]["min_mbps"],
+            "upload_avg_mbps": s["upload"]["avg_mbps"],
+            "latency_avg_ms": s["latency"]["avg_ms"],
+            "latency_max_ms": s["latency"]["max_ms"],
+            "alert_count": s["alert_count"],
+            "warning_count": s["warning_count"],
+            "critical_count": s["critical_count"]
+        })
+    return aggregated
+
+
+def filter_by_time_range(results: List[Dict], hours: int) -> List[Dict]:
+    if hours <= 0:
+        return results
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return [r for r in results if (parse_ts(r.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
+
+
+def filter_by_time_window(results: List[Dict], start_hours_ago: int, end_hours_ago: int) -> List[Dict]:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=start_hours_ago)
+    end = now - timedelta(hours=end_hours_ago)
+    return [r for r in results if start <= (parse_ts(r.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)) <= end]
+
+
+def filter_baseline_window(results: List[Dict], days: int = 7, target_hour: Optional[int] = None) -> List[Dict]:
+    if target_hour is None:
+        target_hour = datetime.now(timezone.utc).hour
+    start = datetime.now(timezone.utc) - timedelta(days=days)
+    return [r for r in results if (lambda ts: ts and ts >= start and ts.hour == target_hour)(parse_ts(r.get("timestamp")))]
 
 
 def calc_change(current: float, previous: float) -> Dict:
@@ -859,28 +1062,22 @@ def analyze_results(results: List[Dict]) -> Dict:
             "total_tests": 0,
             "time_range": None,
             "summary": compute_summary([]),
-            "server_distribution": {}
+            "server_distribution": {},
+            "worst_server": None,
+            "alert_count": 0,
+            "warning_count": 0,
+            "critical_count": 0,
+            "trend": []
         }
 
     summary = compute_summary(results)
-
     server_counts: Dict[str, int] = {}
     for r in results:
         s = r.get("server", {}).get("name", "未知")
         server_counts[s] = server_counts.get(s, 0) + 1
-
     server_distribution = {k: {"count": v, "percentage": round(v / len(results) * 100, 1)} for k, v in server_counts.items()}
 
-    timestamps = []
-    for r in results:
-        try:
-            ts_str = r.get("timestamp")
-            if ts_str and ts_str.endswith("Z"):
-                ts_str = ts_str[:-1] + "+00:00"
-            timestamps.append(datetime.fromisoformat(ts_str))
-        except (ValueError, TypeError):
-            continue
-
+    timestamps = [parse_ts(r.get("timestamp")) for r in results if parse_ts(r.get("timestamp"))]
     time_range = None
     if timestamps:
         time_range = {
@@ -889,33 +1086,36 @@ def analyze_results(results: List[Dict]) -> Dict:
             "duration_hours": round((max(timestamps) - min(timestamps)).total_seconds() / 3600, 2)
         }
 
-    trend_data = []
-    for r in results:
-        trend_data.append({
-            "timestamp": r.get("timestamp"),
-            "local_time": r.get("local_time"),
-            "download_mbps": r.get("download", {}).get("speed_mbps", 0),
-            "upload_mbps": r.get("upload", {}).get("speed_mbps", 0),
-            "latency_ms": r.get("latency", {}).get("avg_ms", 0),
-            "quality": r.get("quality_evaluation", {}).get("quality", ""),
-            "success": r.get("test_success", False),
-            "alert": r.get("alert", {}).get("triggered", False)
-        })
+    worst = compute_worst_server(results)
+
+    trend_data = [{
+        "timestamp": r.get("timestamp"), "local_time": r.get("local_time"),
+        "download_mbps": r.get("download", {}).get("speed_mbps", 0),
+        "upload_mbps": r.get("upload", {}).get("speed_mbps", 0),
+        "latency_ms": r.get("latency", {}).get("avg_ms", 0),
+        "quality": r.get("quality_evaluation", {}).get("quality", ""),
+        "success": r.get("test_success", False),
+        "alert": r.get("alert", {}).get("triggered", False),
+        "severity": r.get("alert", {}).get("highest_severity", "none")
+    } for r in results]
 
     return {
         "total_tests": len(results),
         "time_range": time_range,
         "summary": summary,
         "server_distribution": server_distribution,
+        "worst_server": worst,
+        "alert_count": summary.get("alert_count", 0),
+        "warning_count": summary.get("warning_count", 0),
+        "critical_count": summary.get("critical_count", 0),
         "trend": trend_data
     }
-
-
 def cmd_baseline(args):
     try:
         results = read_jsonl(args.input)
         if not results:
             output_error_json("JSONL文件为空或不存在", "no_data")
+        results = filter_results(results, getattr(args, "server", None), getattr(args, "tags", None))
 
         target_hour = getattr(args, "hour", None)
         if target_hour is None:
@@ -994,6 +1194,7 @@ def cmd_baseline(args):
 def cmd_analyze(args):
     try:
         results = read_jsonl(args.input)
+        results = filter_results(results, getattr(args, "server", None), getattr(args, "tags", None))
         filtered = filter_by_time_range(results, args.hours)
         analysis = analyze_results(filtered)
         fmt = getattr(args, "fmt", "full")
@@ -1001,6 +1202,61 @@ def cmd_analyze(args):
         print(json.dumps(output, ensure_ascii=False, indent=2))
     except Exception as e:
         output_error_json(f"分析失败: {e}", "analyze_error")
+
+
+def cmd_report(args):
+    try:
+        results = read_jsonl(args.input)
+        if not results:
+            output_error_json("JSONL文件为空或不存在", "no_data")
+        results = filter_results(results, getattr(args, "server", None), getattr(args, "tags", None))
+        filtered = filter_by_time_range(results, getattr(args, "hours", 0))
+        period = getattr(args, "period", "hour")
+        aggregated = aggregate_by_period(filtered, period)
+        overall = analyze_results(filtered)
+        worst_period = None
+        if aggregated:
+            def period_score(p):
+                s = 0
+                s += (100 - p["success_rate"]) * 2
+                s += max(0, 50 - p["download_avg_mbps"]) * 1
+                s += p["latency_avg_ms"] * 0.3
+                s += p["alert_count"] * 10
+                s += p["critical_count"] * 30
+                return s
+            worst_period = sorted(aggregated, key=period_score, reverse=True)[0]
+        fmt = getattr(args, "fmt", "full")
+        if fmt == "summary":
+            output = {
+                "period": period,
+                "period_count": len(aggregated),
+                "total_tests": overall.get("total_tests", 0),
+                "overall_success_rate": overall.get("summary", {}).get("success_rate", 0.0),
+                "overall_download_avg_mbps": overall.get("summary", {}).get("download", {}).get("avg_mbps", 0.0),
+                "overall_upload_avg_mbps": overall.get("summary", {}).get("upload", {}).get("avg_mbps", 0.0),
+                "overall_latency_avg_ms": overall.get("summary", {}).get("latency", {}).get("avg_ms", 0.0),
+                "total_alert_count": overall.get("summary", {}).get("alert_count", 0),
+                "total_critical_count": overall.get("summary", {}).get("critical_count", 0),
+                "worst_period": worst_period,
+                "worst_server": overall.get("worst_server"),
+                "periods": aggregated
+            }
+        else:
+            output = {
+                "report_config": {
+                    "period": period,
+                    "hours": getattr(args, "hours", 0),
+                    "server": getattr(args, "server", None),
+                    "tags": getattr(args, "tags", None)
+                },
+                "overall": overall,
+                "period_count": len(aggregated),
+                "periods": aggregated,
+                "worst_period": worst_period
+            }
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    except Exception as e:
+        output_error_json(f"报表生成失败: {e}", "report_error")
 
 
 def resolve_servers(args) -> Tuple[List[Dict], Optional[str]]:
@@ -1111,14 +1367,33 @@ def cmd_test(args):
                 print(f"历史测试: {state.get('total_tests', 0)} 次, 连续失败: {state.get('consecutive_failures', 0)} 次", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
 
-        alert_rules = {}
+        alert_rules, alert_warn = load_alert_rules(getattr(args, "alert_config", None))
+        if alert_warn and not getattr(args, "json", False):
+            print(f"提示: {alert_warn}", file=sys.stderr)
+
+        cli_overrides = {"rules": {}}
         if getattr(args, "alert_download_min", None) is not None:
-            alert_rules["download_min_mbps"] = args.alert_download_min
+            cli_overrides["rules"]["download"] = {
+                "enabled": True,
+                "warning": {"min_mbps": float(args.alert_download_min)},
+                "critical": {"min_mbps": float(args.alert_download_min) * 0.5}
+            }
         if getattr(args, "alert_latency_max", None) is not None:
-            alert_rules["latency_max_ms"] = args.alert_latency_max
+            cli_overrides["rules"]["latency"] = {
+                "enabled": True,
+                "warning": {"max_ms": float(args.alert_latency_max)},
+                "critical": {"max_ms": float(args.alert_latency_max) * 2}
+            }
         if getattr(args, "alert_consecutive_fail", None) is not None:
-            alert_rules["consecutive_fail"] = args.alert_consecutive_fail
-        alert_rules["_recent_results"] = state.get("recent_results", []) if state else []
+            cli_overrides["rules"]["consecutive_fail"] = {
+                "enabled": True,
+                "warning": {"count": max(1, args.alert_consecutive_fail - 1)},
+                "critical": {"count": args.alert_consecutive_fail}
+            }
+        if cli_overrides["rules"]:
+            alert_rules = {"rules": {**alert_rules["rules"], **cli_overrides["rules"]}}
+
+        recent_results = state.get("recent_results", []) if state else []
 
         while True:
             result = run_test(
@@ -1131,19 +1406,33 @@ def cmd_test(args):
                 tag_matched=tag_matched
             )
 
-            if alert_rules:
-                consecutive_fail_count = state.get("consecutive_failures", 0) if state else 0
-                if not result["test_success"]:
-                    consecutive_fail_count += 1
-                else:
-                    consecutive_fail_count = 0
-                alert_rules["_consecutive_fail_count"] = consecutive_fail_count
-                alert_result = check_alert_rules(result, alert_rules)
-                result["alert"] = alert_result
-                if alert_result["triggered"]:
-                    if not getattr(args, "json", False):
-                        for rule in alert_result["rules_triggered"]:
-                            print(f"⚠ 告警: {rule['message']}", file=sys.stderr)
+            consecutive_fail_count = state.get("consecutive_failures", 0) if state else 0
+            if not result["test_success"]:
+                consecutive_fail_count += 1
+            else:
+                consecutive_fail_count = 0
+
+            window_sr = None
+            sr_cfg = alert_rules.get("rules", {}).get("success_rate", {})
+            if sr_cfg.get("enabled", True) and recent_results:
+                window_minutes = sr_cfg.get("window_minutes", 60)
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+                recent_window = [r for r in recent_results if (parse_ts(r.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
+                if recent_window:
+                    rsc = sum(1 for r in recent_window if r.get("test_success", False))
+                    window_sr = round(rsc / len(recent_window) * 100, 1)
+
+            ctx = {
+                "consecutive_failures": consecutive_fail_count,
+                "window_success_rate": window_sr
+            }
+            alert_result = check_alert_rules(result, alert_rules, ctx)
+            result["alert"] = alert_result
+            if alert_result["triggered"]:
+                if not getattr(args, "json", False):
+                    for rule in alert_result["rules_triggered"]:
+                        sev_tag = "[严重]" if rule.get("severity") == "critical" else "[警告]"
+                        print(f"⚠ {sev_tag} {rule['message']}", file=sys.stderr)
 
             if state is not None:
                 state = update_state_with_result(state, result)
@@ -1220,21 +1509,22 @@ def add_test_arguments(parser):
     parser.add_argument("--upload-url", type=str, help="指定上传测试URL")
     parser.add_argument("--latency-url", type=str, help="指定延迟测试URL")
     parser.add_argument("--server-name", type=str, default="Custom", help="指定服务器名称")
-    parser.add_argument("--download-size", type=int, help="下载测试文件大小(MB)，默认使用服务器配置")
-    parser.add_argument("--upload-size", type=int, default=10, help="上传测试文件大小(MB)，默认10MB")
+    parser.add_argument("--download-size", type=positive_int, help="下载测试文件大小(MB)，默认使用服务器配置")
+    parser.add_argument("--upload-size", type=positive_int, default=10, help="上传测试文件大小(MB)，默认10MB")
     parser.add_argument("--skip-upload", action="store_true", help="跳过上传测试")
     parser.add_argument("--auto-select", action="store_true", help="自动选择最近的服务器")
     parser.add_argument("--servers-file", type=str, help="自定义服务器列表JSON文件路径")
     parser.add_argument("--tags", type=str, nargs="*", help="按标签筛选服务器，如: 电信 国内")
     parser.add_argument("--continuous", action="store_true", help="启用连续测试模式")
-    parser.add_argument("--interval", type=int, default=600, help="连续测试间隔(秒)，默认600秒(10分钟)")
+    parser.add_argument("--interval", type=positive_int, default=600, help="连续测试间隔(秒)，默认600秒(10分钟)")
     parser.add_argument("--output", type=str, help="JSONL输出文件路径，用于保存连续测试结果")
     parser.add_argument("--webhook", type=str, help="测试结果Webhook推送地址")
     parser.add_argument("--json", action="store_true", help="仅输出JSON格式结果")
     parser.add_argument("--state-file", type=str, help="状态文件路径，用于记录累计测试状态，程序重启后可恢复")
-    parser.add_argument("--alert-download-min", type=float, help="告警：下载速度低于此值(Mbps)触发")
-    parser.add_argument("--alert-latency-max", type=float, help="告警：延迟高于此值(ms)触发")
-    parser.add_argument("--alert-consecutive-fail", type=int, help="告警：连续失败达到此次数触发")
+    parser.add_argument("--alert-config", type=str, help="告警规则配置文件路径(JSON格式)")
+    parser.add_argument("--alert-download-min", type=positive_float, help="告警：下载速度低于此值(Mbps)触发")
+    parser.add_argument("--alert-latency-max", type=positive_float, help="告警：延迟高于此值(ms)触发")
+    parser.add_argument("--alert-consecutive-fail", type=positive_int, help="告警：连续失败达到此次数触发")
 
 
 def _detect_json_mode() -> bool:
@@ -1242,7 +1532,7 @@ def _detect_json_mode() -> bool:
 
 
 def _detect_subcommand() -> Optional[str]:
-    subcommands = {"test", "analyze", "compare", "baseline"}
+    subcommands = {"test", "analyze", "compare", "baseline", "report"}
     for arg in sys.argv[1:]:
         if not arg.startswith("-"):
             return arg if arg in subcommands else None
@@ -1260,13 +1550,7 @@ def _format_output(data: Dict, fmt: str) -> Dict:
 def _extract_summary(data: Dict) -> Dict:
     if "summary" in data and "total_tests" in data:
         summary = data.get("summary", {})
-        server_dist = data.get("server_distribution", {})
-        worst_server = None
-        worst_pct = 0
-        for name, info in server_dist.items():
-            if info.get("percentage", 0) > worst_pct:
-                worst_pct = info["percentage"]
-                worst_server = name
+        worst_server_obj = data.get("worst_server")
         return {
             "total_tests": data.get("total_tests", 0),
             "success_rate": summary.get("success_rate", 0.0),
@@ -1275,20 +1559,37 @@ def _extract_summary(data: Dict) -> Dict:
             "upload_avg_mbps": summary.get("upload", {}).get("avg_mbps", 0.0),
             "latency_avg_ms": summary.get("latency", {}).get("avg_ms", 0.0),
             "latency_max_ms": summary.get("latency", {}).get("max_ms", 0.0),
-            "alert_count": data.get("alert_count", 0) if "alert_count" in data else None,
-            "worst_server": worst_server,
+            "alert_count": summary.get("alert_count", 0),
+            "warning_count": summary.get("warning_count", 0),
+            "critical_count": summary.get("critical_count", 0),
+            "worst_server": {
+                "name": worst_server_obj.get("name") if worst_server_obj else None,
+                "score": worst_server_obj.get("composite_score") if worst_server_obj else None,
+                "failure_rate": worst_server_obj.get("failure_rate") if worst_server_obj else None
+            } if worst_server_obj else {"name": None, "score": None, "failure_rate": None},
             "time_range": data.get("time_range")
         }
     if "changes" in data and "current_period" in data:
         alerts = data.get("alerts", [])
+        current_s = data.get("current_period", {})
+        current_worst = data.get("current_worst_server")
         return {
             "hours": data.get("comparison_config", {}).get("hours", 0),
+            "server": data.get("comparison_config", {}).get("server"),
+            "tags": data.get("comparison_config", {}).get("tags"),
             "current": {
-                "download_avg_mbps": data.get("current_period", {}).get("download", {}).get("avg_mbps", 0.0),
-                "upload_avg_mbps": data.get("current_period", {}).get("upload", {}).get("avg_mbps", 0.0),
-                "latency_avg_ms": data.get("current_period", {}).get("latency", {}).get("avg_ms", 0.0),
-                "success_rate": data.get("current_period", {}).get("success_rate", 0.0)
+                "download_avg_mbps": current_s.get("download", {}).get("avg_mbps", 0.0),
+                "upload_avg_mbps": current_s.get("upload", {}).get("avg_mbps", 0.0),
+                "latency_avg_ms": current_s.get("latency", {}).get("avg_ms", 0.0),
+                "success_rate": current_s.get("success_rate", 0.0),
+                "alert_count": current_s.get("alert_count", 0),
+                "warning_count": current_s.get("warning_count", 0),
+                "critical_count": current_s.get("critical_count", 0)
             },
+            "current_worst_server": {
+                "name": current_worst.get("name") if current_worst else None,
+                "score": current_worst.get("composite_score") if current_worst else None
+            } if current_worst else {"name": None, "score": None},
             "changes": {
                 "download_speed": data.get("changes", {}).get("download_speed", {}),
                 "upload_speed": data.get("changes", {}).get("upload_speed", {}),
@@ -1318,6 +1619,8 @@ def _extract_summary(data: Dict) -> Dict:
                 "deviation_percent": data.get("anomaly", {}).get("latency", {}).get("deviation_percent", 0.0)
             }
         }
+    if "periods" in data and "period_count" in data:
+        return data
     return data
 
 
@@ -1336,22 +1639,37 @@ def main():
     analyze_parser = subparsers.add_parser("analyze", help="分析历史JSONL数据")
     analyze_parser.set_json_mode(json_mode, "analyze")
     analyze_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
-    analyze_parser.add_argument("--hours", type=int, default=0, help="统计最近N小时的数据，0表示全部数据")
+    analyze_parser.add_argument("--hours", type=positive_int, default=0, help="统计最近N小时的数据，0表示全部数据")
+    analyze_parser.add_argument("--server", type=str, help="只分析指定服务器名的数据")
+    analyze_parser.add_argument("--tags", type=str, nargs="*", help="只分析包含指定标签的服务器数据")
     analyze_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
 
     compare_parser = subparsers.add_parser("compare", help="对比两个时段的网络质量变化")
     compare_parser.set_json_mode(json_mode, "compare")
     compare_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
-    compare_parser.add_argument("--hours", type=int, default=1, help="对比时段长度(小时)，默认1小时(即最近1h vs 前1h)")
+    compare_parser.add_argument("--hours", type=positive_int, default=1, help="对比时段长度(小时)，默认1小时(即最近1h vs 前1h)")
+    compare_parser.add_argument("--server", type=str, help="只对比指定服务器名的数据")
+    compare_parser.add_argument("--tags", type=str, nargs="*", help="只对比包含指定标签的服务器数据")
     compare_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
 
     baseline_parser = subparsers.add_parser("baseline", help="基于历史基线检测异常")
     baseline_parser.set_json_mode(json_mode, "baseline")
     baseline_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
-    baseline_parser.add_argument("--baseline-days", type=int, default=7, help="基线数据天数，默认7天")
-    baseline_parser.add_argument("--hour", type=int, help="目标小时(0-23)，默认当前小时")
-    baseline_parser.add_argument("--hours", type=int, default=1, help="待检测时段长度(小时)，默认1小时")
+    baseline_parser.add_argument("--baseline-days", type=positive_int, default=7, help="基线数据天数，默认7天")
+    baseline_parser.add_argument("--hour", type=hour_range, help="目标小时(0-23)，默认当前小时")
+    baseline_parser.add_argument("--hours", type=positive_int, default=1, help="待检测时段长度(小时)，默认1小时")
+    baseline_parser.add_argument("--server", type=str, help="只分析指定服务器名的数据")
+    baseline_parser.add_argument("--tags", type=str, nargs="*", help="只分析包含指定标签的服务器数据")
     baseline_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
+
+    report_parser = subparsers.add_parser("report", help="按时间聚合输出运维报表")
+    report_parser.set_json_mode(json_mode, "report")
+    report_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
+    report_parser.add_argument("--period", choices=["hour", "day"], default="hour", help="聚合粒度: hour(按小时) 或 day(按天)")
+    report_parser.add_argument("--hours", type=positive_int, default=0, help="统计最近N小时的数据，0表示全部数据")
+    report_parser.add_argument("--server", type=str, help="只分析指定服务器名的数据")
+    report_parser.add_argument("--tags", type=str, nargs="*", help="只分析包含指定标签的服务器数据")
+    report_parser.add_argument("--format", dest="fmt", choices=["full", "summary"], default="full", help="输出格式: full(完整) 或 summary(精简)")
 
     default_parser = JsonErrorArgumentParser(description="网速测试工具 - 输出结构化JSON数据", add_help=False)
     default_parser.set_json_mode(json_mode, "test")
@@ -1366,6 +1684,8 @@ def main():
             cmd_compare(args)
         elif args.command == "baseline":
             cmd_baseline(args)
+        elif args.command == "report":
+            cmd_report(args)
         else:
             cmd_test(args)
     else:
@@ -1379,21 +1699,26 @@ def cmd_compare(args):
         results = read_jsonl(args.input)
         if not results:
             output_error_json("JSONL文件为空或不存在", "no_data")
+        results = filter_results(results, getattr(args, "server", None), getattr(args, "tags", None))
 
         current_results = filter_by_time_window(results, args.hours, 0)
         previous_results = filter_by_time_window(results, args.hours * 2, args.hours)
 
         current_summary = compute_summary(current_results)
         previous_summary = compute_summary(previous_results)
+        current_worst = compute_worst_server(current_results)
 
         comparison = {
             "comparison_config": {
                 "current_period": f"最近 {args.hours} 小时",
                 "previous_period": f"前 {args.hours} 小时",
-                "hours": args.hours
+                "hours": args.hours,
+                "server": getattr(args, "server", None),
+                "tags": getattr(args, "tags", None)
             },
             "current_period": current_summary,
             "previous_period": previous_summary,
+            "current_worst_server": current_worst,
             "changes": {
                 "download_speed": calc_change(
                     current_summary["download"]["avg_mbps"],

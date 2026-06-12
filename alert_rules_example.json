@@ -1,0 +1,41 @@
+{
+  "_comment": "告警规则配置示例 - 所有规则都支持warning和critical两级，可按需启用/禁用，不写的阈值项使用默认值",
+  "rules": {
+    "download": {
+      "enabled": true,
+      "warning": { "min_mbps": 50 },
+      "critical": { "min_mbps": 10 }
+    },
+    "upload": {
+      "enabled": true,
+      "warning": { "min_mbps": 10 },
+      "critical": { "min_mbps": 2 }
+    },
+    "latency": {
+      "enabled": true,
+      "warning": { "max_ms": 100 },
+      "critical": { "max_ms": 300 }
+    },
+    "packet_loss": {
+      "enabled": true,
+      "warning": { "max_percent": 5 },
+      "critical": { "max_percent": 20 }
+    },
+    "success_rate": {
+      "enabled": true,
+      "window_minutes": 60,
+      "warning": { "min_percent": 90 },
+      "critical": { "min_percent": 70 }
+    },
+    "anomaly_level": {
+      "enabled": true,
+      "warning_above": "mild",
+      "critical_above": "severe"
+    },
+    "consecutive_fail": {
+      "enabled": true,
+      "warning": { "count": 2 },
+      "critical": { "count": 5 }
+    }
+  }
+}
