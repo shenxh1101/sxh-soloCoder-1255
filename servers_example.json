@@ -1,0 +1,14 @@
+[
+  {
+    "name": "我的测试服务器1",
+    "download_url": "http://example.com/download?size=25000000",
+    "upload_url": "http://example.com/upload",
+    "latency_url": "http://example.com/ping"
+  },
+  {
+    "name": "我的测试服务器2",
+    "download_url": "http://example2.com/testfile.bin",
+    "upload_url": "http://example2.com/upload",
+    "latency_url": "http://example2.com"
+  }
+]
