@@ -20,6 +20,8 @@ DEFAULT_SERVERS = [
         "city": "北京",
         "isp": "中国电信",
         "tags": ["电信", "国内", "北方"],
+        "weight": 10,
+        "disabled": False,
         "download_url": "http://speedtest1.bjtelecom.net:8080/download",
         "download_size_param": "size",
         "default_download_size": 25,
@@ -33,6 +35,8 @@ DEFAULT_SERVERS = [
         "city": "上海",
         "isp": "中国联通",
         "tags": ["联通", "国内", "南方"],
+        "weight": 10,
+        "disabled": False,
         "download_url": "http://speedtest2.shunicom.net:8080/download",
         "download_size_param": "size",
         "default_download_size": 25,
@@ -46,6 +50,8 @@ DEFAULT_SERVERS = [
         "city": "广州",
         "isp": "中国电信",
         "tags": ["电信", "国内", "南方"],
+        "weight": 10,
+        "disabled": False,
         "download_url": "http://speedtest3.guangzhou.gd.cn:8080/download",
         "download_size_param": "size",
         "default_download_size": 25,
@@ -59,6 +65,8 @@ DEFAULT_SERVERS = [
         "city": "Anycast",
         "isp": "Cloudflare",
         "tags": ["海外", "CDN", "全球"],
+        "weight": 5,
+        "disabled": False,
         "download_url": "https://speed.cloudflare.com/__down",
         "download_size_param": "bytes",
         "default_download_size": 25,
@@ -72,6 +80,8 @@ DEFAULT_SERVERS = [
         "city": "Anycast",
         "isp": "Google",
         "tags": ["海外", "全球"],
+        "weight": 3,
+        "disabled": False,
         "download_url": "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png",
         "download_size_param": None,
         "default_download_size": 0,
@@ -79,6 +89,19 @@ DEFAULT_SERVERS = [
         "latency_url": "https://www.gstatic.com/generate_204"
     }
 ]
+
+
+def output_error_json(message: str, error_type: str = "error", details: Optional[Dict] = None) -> None:
+    error_result = {
+        "success": False,
+        "error": error_type,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    if details:
+        error_result["details"] = details
+    print(json.dumps(error_result, ensure_ascii=False, indent=2))
+    sys.exit(1)
 
 
 def build_download_url(server: Dict, size_mb: Optional[int] = None) -> str:
@@ -120,9 +143,9 @@ def measure_latency(url: str, count: int = 5, timeout: int = 10) -> Dict:
         except Exception as e:
             errors.append(str(e))
         if i < count - 1:
-                time.sleep(0.1)
+            time.sleep(0.1)
 
-    result = {
+    return {
         "success": len(latencies) > 0,
         "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
         "min_ms": round(min(latencies), 2) if latencies else 0.0,
@@ -133,7 +156,6 @@ def measure_latency(url: str, count: int = 5, timeout: int = 10) -> Dict:
         "success_count": len(latencies),
         "total_count": count
     }
-    return result
 
 
 def measure_download_speed(url: str, timeout: int = 60) -> Dict:
@@ -224,49 +246,70 @@ def measure_upload_speed(url: str, data_size_mb: int = 10, timeout: int = 60) ->
         }
 
 
-def filter_servers_by_tags(servers: List[Dict], tags: List[str]) -> List[Dict]:
+def get_active_servers(servers: List[Dict]) -> List[Dict]:
+    return [s for s in servers if not s.get("disabled", False)]
+
+
+def filter_servers_by_tags(servers: List[Dict], tags: Optional[List[str]]) -> Tuple[List[Dict], bool]:
     if not tags:
-        return servers
-    return [s for s in servers if any(t in s.get("tags", []) for t in tags)]
+        return servers, True
+    filtered = [s for s in servers if any(t in s.get("tags", []) for t in tags)]
+    return filtered, len(filtered) > 0
 
 
-def select_best_server(servers: List[Dict], tags: Optional[List[str]] = None) -> Tuple[Dict, List[Dict]]:
-    filtered = filter_servers_by_tags(servers, tags)
-    if not filtered:
-        filtered = servers
+def select_best_server(servers: List[Dict], tags: Optional[List[str]] = None) -> Tuple[Dict, List[Dict], bool]:
+    active = get_active_servers(servers)
+    tag_matched = True
+
+    if tags:
+        active, tag_matched = filter_servers_by_tags(active, tags)
+        if not tag_matched:
+            return None, [], False
+
+    if not active:
+        return None, [], tag_matched
 
     candidates = []
-    for server in filtered:
+    for server in active:
         latency_url = extract_latency_url(server)
         latency_result = measure_latency(latency_url, count=2, timeout=5)
+        weight = server.get("weight", 10)
+        effective_latency = latency_result["avg_ms"] if latency_result["success"] else float('inf')
+        weighted_score = effective_latency / (weight / 10) if effective_latency != float('inf') else float('inf')
         candidates.append({
             "server": server,
-            "latency": latency_result["avg_ms"] if latency_result["success"] else float('inf'),
+            "weight": weight,
+            "latency": effective_latency,
+            "weighted_score": weighted_score,
             "latency_result": latency_result
         })
 
     valid_candidates = [c for c in candidates if c["latency"] != float('inf')]
     if not valid_candidates:
-        best = filtered[0]
+        best = active[0]
         selection_reason = [{
-            "server_id": s["server"]["id"],
-            "server_name": s["server"]["name"],
-            "latency_ms": s["latency_result"]["avg_ms"],
-            "success": s["latency_result"]["success"],
-            "errors": s["latency_result"]["errors"]
-        } for s in candidates]
-        return best, selection_reason
+            "server_id": c["server"]["id"],
+            "server_name": c["server"]["name"],
+            "weight": c["weight"],
+            "latency_ms": c["latency_result"]["avg_ms"],
+            "weighted_score": None,
+            "success": c["latency_result"]["success"],
+            "errors": c["latency_result"]["errors"]
+        } for c in candidates]
+        return best, selection_reason, tag_matched
 
-    valid_candidates.sort(key=lambda x: x["latency"])
+    valid_candidates.sort(key=lambda x: x["weighted_score"])
     best = valid_candidates[0]["server"]
     selection_reason = [{
         "server_id": c["server"]["id"],
         "server_name": c["server"]["name"],
+        "weight": c["weight"],
         "latency_ms": c["latency_result"]["avg_ms"],
+        "weighted_score": round(c["weighted_score"], 2) if c["weighted_score"] != float('inf') else None,
         "success": c["latency_result"]["success"],
         "errors": c["latency_result"]["errors"]
     } for c in candidates]
-    return best, selection_reason
+    return best, selection_reason, tag_matched
 
 
 def evaluate_network_quality(download_mbps: float, upload_mbps: float, latency_ms: float,
@@ -337,6 +380,57 @@ def evaluate_network_quality(download_mbps: float, upload_mbps: float, latency_m
     return quality, suggestion.strip()
 
 
+def check_alert_rules(result: Dict, alert_rules: Dict) -> Dict:
+    if not alert_rules:
+        return {"triggered": False, "rules_triggered": []}
+
+    triggered_rules = []
+    download_threshold = alert_rules.get("download_min_mbps")
+    latency_threshold = alert_rules.get("latency_max_ms")
+    fail_count_threshold = alert_rules.get("consecutive_fail")
+
+    if download_threshold is not None and result["download"]["success"]:
+        if result["download"]["speed_mbps"] < download_threshold:
+            triggered_rules.append({
+                "rule": "download_below_threshold",
+                "threshold_mbps": download_threshold,
+                "actual_mbps": result["download"]["speed_mbps"],
+                "message": f"下载速度 {result['download']['speed_mbps']:.2f} Mbps 低于阈值 {download_threshold} Mbps"
+            })
+
+    if latency_threshold is not None and result["latency"]["success"]:
+        if result["latency"]["avg_ms"] > latency_threshold:
+            triggered_rules.append({
+                "rule": "latency_above_threshold",
+                "threshold_ms": latency_threshold,
+                "actual_ms": result["latency"]["avg_ms"],
+                "message": f"延迟 {result['latency']['avg_ms']:.2f} ms 超过阈值 {latency_threshold} ms"
+            })
+
+    if fail_count_threshold is not None:
+        consecutive_fails = 0
+        if not result["test_success"]:
+            consecutive_fails = 1
+            if alert_rules.get("_recent_results"):
+                for prev in reversed(alert_rules["_recent_results"]):
+                    if not prev.get("test_success", True):
+                        consecutive_fails += 1
+                    else:
+                        break
+        if consecutive_fails >= fail_count_threshold:
+            triggered_rules.append({
+                "rule": "consecutive_failures",
+                "threshold_count": fail_count_threshold,
+                "actual_count": consecutive_fails,
+                "message": f"连续测试失败 {consecutive_fails} 次，达到阈值 {fail_count_threshold} 次"
+            })
+
+    return {
+        "triggered": len(triggered_rules) > 0,
+        "rules_triggered": triggered_rules
+    }
+
+
 def send_to_webhook(webhook_url: str, result: Dict, timeout: int = 10) -> bool:
     try:
         response = requests.post(
@@ -353,7 +447,7 @@ def send_to_webhook(webhook_url: str, result: Dict, timeout: int = 10) -> bool:
 
 def run_test(server: Dict, upload_size_mb: int = 10, download_size_mb: Optional[int] = None,
               skip_upload: bool = False, selection_reason: Optional[List[Dict]] = None,
-              selection_method: str = "default") -> Dict:
+              selection_method: str = "default", tag_matched: bool = True) -> Dict:
     timestamp = datetime.now(timezone.utc).isoformat()
     local_time = datetime.now().isoformat()
 
@@ -394,6 +488,7 @@ def run_test(server: Dict, upload_size_mb: int = 10, download_size_mb: Optional[
             "method": selection_method,
             "selected_server_id": server.get("id"),
             "selected_server_name": server["name"],
+            "tag_matched": tag_matched,
             "reason": selection_reason or []
         },
         "server": {
@@ -403,6 +498,7 @@ def run_test(server: Dict, upload_size_mb: int = 10, download_size_mb: Optional[
             "city": server.get("city"),
             "isp": server.get("isp"),
             "tags": server.get("tags", []),
+            "weight": server.get("weight", 10),
             "download_url": download_url,
             "upload_url": server.get("upload_url"),
             "latency_url": latency_url
@@ -418,6 +514,10 @@ def run_test(server: Dict, upload_size_mb: int = 10, download_size_mb: Optional[
         "quality_evaluation": {
             "quality": quality,
             "suggestion": suggestion
+        },
+        "alert": {
+            "triggered": False,
+            "rules_triggered": []
         }
     }
 
@@ -429,14 +529,19 @@ def append_to_jsonl(filepath: str, result: Dict) -> None:
         f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
 
-def load_custom_servers(filepath: str) -> List[Dict]:
+def load_custom_servers(filepath: str) -> Tuple[List[Dict], Optional[str]]:
     if not os.path.exists(filepath):
-        return []
-    with open(filepath, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        return [], f"服务器配置文件不存在: {filepath}"
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return [], f"服务器配置文件JSON格式错误: {e}"
+    except Exception as e:
+        return [], f"读取服务器配置文件失败: {e}"
     if isinstance(data, list):
-        return data
-    return data.get("servers", [])
+        return data, None
+    return data.get("servers", []), None
 
 
 def read_jsonl(filepath: str) -> List[Dict]:
@@ -467,19 +572,38 @@ def filter_by_time_range(results: List[Dict], hours: int) -> List[Dict]:
             ts = datetime.fromisoformat(ts_str)
             if ts >= cutoff:
                 filtered.append(r)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             continue
     return filtered
 
 
-def analyze_results(results: List[Dict]) -> Dict:
+def filter_by_time_window(results: List[Dict], start_hours_ago: int, end_hours_ago: int) -> List[Dict]:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=start_hours_ago)
+    end = now - timedelta(hours=end_hours_ago)
+    filtered = []
+    for r in results:
+        try:
+            ts_str = r.get("timestamp")
+            if ts_str.endswith("Z"):
+                ts_str = ts_str[:-1] + "+00:00"
+            ts = datetime.fromisoformat(ts_str)
+            if start <= ts <= end:
+                filtered.append(r)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return filtered
+
+
+def compute_summary(results: List[Dict]) -> Dict:
     if not results:
         return {
-            "total_tests": 0,
-            "time_range": None,
-            "summary": {},
-            "quality_distribution": {},
-            "server_distribution": {}
+            "count": 0,
+            "download": {"avg_mbps": 0.0, "min_mbps": 0.0, "max_mbps": 0.0, "median_mbps": 0.0},
+            "upload": {"avg_mbps": 0.0, "min_mbps": 0.0, "max_mbps": 0.0, "median_mbps": 0.0},
+            "latency": {"avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "median_ms": 0.0},
+            "success_rate": 0.0,
+            "quality_distribution": {}
         }
 
     download_speeds = [r["download"]["speed_mbps"] for r in results if r.get("download", {}).get("success", False) and r["download"]["speed_mbps"] > 0]
@@ -491,12 +615,75 @@ def analyze_results(results: List[Dict]) -> Dict:
         q = r.get("quality_evaluation", {}).get("quality", "未知")
         quality_counts[q] = quality_counts.get(q, 0) + 1
 
+    success_count = sum(1 for r in results if r.get("test_success", False))
+
+    return {
+        "count": len(results),
+        "download": {
+            "avg_mbps": round(statistics.mean(download_speeds), 2) if download_speeds else 0.0,
+            "min_mbps": round(min(download_speeds), 2) if download_speeds else 0.0,
+            "max_mbps": round(max(download_speeds), 2) if download_speeds else 0.0,
+            "median_mbps": round(statistics.median(download_speeds), 2) if download_speeds else 0.0
+        },
+        "upload": {
+            "avg_mbps": round(statistics.mean(upload_speeds), 2) if upload_speeds else 0.0,
+            "min_mbps": round(min(upload_speeds), 2) if upload_speeds else 0.0,
+            "max_mbps": round(max(upload_speeds), 2) if upload_speeds else 0.0,
+            "median_mbps": round(statistics.median(upload_speeds), 2) if upload_speeds else 0.0
+        },
+        "latency": {
+            "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
+            "min_ms": round(min(latencies), 2) if latencies else 0.0,
+            "max_ms": round(max(latencies), 2) if latencies else 0.0,
+            "median_ms": round(statistics.median(latencies), 2) if latencies else 0.0
+        },
+        "success_rate": round(success_count / len(results) * 100, 1) if results else 0.0,
+        "quality_distribution": quality_counts
+    }
+
+
+def calc_change(current: float, previous: float) -> Dict:
+    if previous == 0:
+        if current == 0:
+            return {"change": 0.0, "percentage": 0.0, "direction": "unchanged"}
+        return {"change": round(current, 2), "percentage": None, "direction": "increased"}
+    change = current - previous
+    percentage = round((change / previous) * 100, 2)
+    direction = "increased" if change > 0 else ("decreased" if change < 0 else "unchanged")
+    return {"change": round(change, 2), "percentage": percentage, "direction": direction}
+
+
+def compare_quality_distributions(current_qd: Dict, previous_qd: Dict) -> Dict:
+    all_qualities = set(list(current_qd.keys()) + list(previous_qd.keys()))
+    comparison = {}
+    for q in all_qualities:
+        curr = current_qd.get(q, 0)
+        prev = previous_qd.get(q, 0)
+        comparison[q] = {
+            "current": curr,
+            "previous": prev,
+            "change": curr - prev
+        }
+    return comparison
+
+
+def analyze_results(results: List[Dict]) -> Dict:
+    if not results:
+        return {
+            "total_tests": 0,
+            "time_range": None,
+            "summary": compute_summary([]),
+            "server_distribution": {}
+        }
+
+    summary = compute_summary(results)
+
     server_counts: Dict[str, int] = {}
     for r in results:
         s = r.get("server", {}).get("name", "未知")
         server_counts[s] = server_counts.get(s, 0) + 1
 
-    success_count = sum(1 for r in results if r.get("test_success", False))
+    server_distribution = {k: {"count": v, "percentage": round(v / len(results) * 100, 1)} for k, v in server_counts.items()}
 
     timestamps = []
     for r in results:
@@ -516,34 +703,6 @@ def analyze_results(results: List[Dict]) -> Dict:
             "duration_hours": round((max(timestamps) - min(timestamps)).total_seconds() / 3600, 2)
         }
 
-    summary = {
-        "download": {
-            "count": len(download_speeds),
-            "avg_mbps": round(statistics.mean(download_speeds), 2) if download_speeds else 0.0,
-            "min_mbps": round(min(download_speeds), 2) if download_speeds else 0.0,
-            "max_mbps": round(max(download_speeds), 2) if download_speeds else 0.0,
-            "median_mbps": round(statistics.median(download_speeds), 2) if download_speeds else 0.0
-        },
-        "upload": {
-            "count": len(upload_speeds),
-            "avg_mbps": round(statistics.mean(upload_speeds), 2) if upload_speeds else 0.0,
-            "min_mbps": round(min(upload_speeds), 2) if upload_speeds else 0.0,
-            "max_mbps": round(max(upload_speeds), 2) if upload_speeds else 0.0,
-            "median_mbps": round(statistics.median(upload_speeds), 2) if upload_speeds else 0.0
-        },
-        "latency": {
-            "count": len(latencies),
-            "avg_ms": round(statistics.mean(latencies), 2) if latencies else 0.0,
-            "min_ms": round(min(latencies), 2) if latencies else 0.0,
-            "max_ms": round(max(latencies), 2) if latencies else 0.0,
-            "median_ms": round(statistics.median(latencies), 2) if latencies else 0.0
-        },
-        "success_rate": round(success_count / len(results) * 100, 1) if results else 0.0
-    }
-
-    quality_distribution = {k: {"count": v, "percentage": round(v / len(results) * 100, 1)} for k, v in quality_counts.items()}
-    server_distribution = {k: {"count": v, "percentage": round(v / len(results) * 100, 1)} for k, v in server_counts.items()}
-
     trend_data = []
     for r in results:
         trend_data.append({
@@ -553,38 +712,108 @@ def analyze_results(results: List[Dict]) -> Dict:
             "upload_mbps": r.get("upload", {}).get("speed_mbps", 0),
             "latency_ms": r.get("latency", {}).get("avg_ms", 0),
             "quality": r.get("quality_evaluation", {}).get("quality", ""),
-            "success": r.get("test_success", False)
+            "success": r.get("test_success", False),
+            "alert": r.get("alert", {}).get("triggered", False)
         })
 
     return {
         "total_tests": len(results),
         "time_range": time_range,
         "summary": summary,
-        "quality_distribution": quality_distribution,
         "server_distribution": server_distribution,
         "trend": trend_data
     }
 
 
 def cmd_analyze(args):
-    results = read_jsonl(args.input)
-    filtered = filter_by_time_range(results, args.hours)
-    analysis = analyze_results(filtered)
-    print(json.dumps(analysis, ensure_ascii=False, indent=2))
+    try:
+        results = read_jsonl(args.input)
+        filtered = filter_by_time_range(results, args.hours)
+        analysis = analyze_results(filtered)
+        print(json.dumps(analysis, ensure_ascii=False, indent=2))
+    except Exception as e:
+        output_error_json(f"分析失败: {e}", "analyze_error")
 
 
-def cmd_test(args):
+def cmd_compare(args):
+    try:
+        results = read_jsonl(args.input)
+        if not results:
+            output_error_json("JSONL文件为空或不存在", "no_data")
+
+        current_results = filter_by_time_window(results, args.hours, 0)
+        previous_results = filter_by_time_window(results, args.hours * 2, args.hours)
+
+        current_summary = compute_summary(current_results)
+        previous_summary = compute_summary(previous_results)
+
+        comparison = {
+            "comparison_config": {
+                "current_period": f"最近 {args.hours} 小时",
+                "previous_period": f"前 {args.hours} 小时",
+                "hours": args.hours
+            },
+            "current_period": current_summary,
+            "previous_period": previous_summary,
+            "changes": {
+                "download_speed": calc_change(
+                    current_summary["download"]["avg_mbps"],
+                    previous_summary["download"]["avg_mbps"]
+                ),
+                "upload_speed": calc_change(
+                    current_summary["upload"]["avg_mbps"],
+                    previous_summary["upload"]["avg_mbps"]
+                ),
+                "latency": calc_change(
+                    current_summary["latency"]["avg_ms"],
+                    previous_summary["latency"]["avg_ms"]
+                ),
+                "success_rate": calc_change(
+                    current_summary["success_rate"],
+                    previous_summary["success_rate"]
+                )
+            },
+            "quality_change": compare_quality_distributions(
+                current_summary["quality_distribution"],
+                previous_summary["quality_distribution"]
+            )
+        }
+
+        alerts = []
+        dl_change = comparison["changes"]["download_speed"]
+        lat_change = comparison["changes"]["latency"]
+        if dl_change["direction"] == "decreased" and dl_change["percentage"] is not None and dl_change["percentage"] < -30:
+            alerts.append(f"下载速度下降 {abs(dl_change['percentage'])}%")
+        if lat_change["direction"] == "increased" and lat_change["percentage"] is not None and lat_change["percentage"] > 50:
+            alerts.append(f"延迟上升 {lat_change['percentage']}%")
+        if current_summary["success_rate"] < 80:
+            alerts.append(f"当前时段成功率仅 {current_summary['success_rate']}%")
+
+        comparison["alerts"] = alerts
+        print(json.dumps(comparison, ensure_ascii=False, indent=2))
+    except Exception as e:
+        output_error_json(f"对比分析失败: {e}", "compare_error")
+
+
+def resolve_servers(args) -> Tuple[List[Dict], Optional[str]]:
     servers = DEFAULT_SERVERS.copy()
     if args.servers_file:
-        custom_servers = load_custom_servers(args.servers_file)
+        custom_servers, load_error = load_custom_servers(args.servers_file)
+        if load_error:
+            return [], load_error
         if custom_servers:
             servers = custom_servers
+    return servers, None
 
+
+def resolve_server_selection(args, servers) -> Tuple[Optional[Dict], Optional[List[Dict]], str, bool, Optional[str]]:
     selected_server = None
     selection_reason = None
     selection_method = "default"
+    tag_matched = True
+    error_msg = None
 
-    if args.download_url:
+    if getattr(args, "download_url", None):
         size_param = None
         parsed = urlparse(args.download_url)
         query_params = parse_qs(parsed.query)
@@ -594,97 +823,189 @@ def cmd_test(args):
             size_param = "bytes"
         selected_server = {
             "id": "custom",
-            "name": args.server_name,
+            "name": getattr(args, "server_name", "Custom"),
             "region": None,
             "city": None,
             "isp": None,
             "tags": ["自定义"],
+            "weight": 10,
+            "disabled": False,
             "download_url": args.download_url,
             "download_size_param": size_param,
-            "default_download_size": args.download_size if args.download_size else 25,
-            "upload_url": args.upload_url,
-            "latency_url": args.latency_url
+            "default_download_size": getattr(args, "download_size", None) or 25,
+            "upload_url": getattr(args, "upload_url", None),
+            "latency_url": getattr(args, "latency_url", None)
         }
         selection_method = "manual_url"
-    elif args.auto_select:
-        if not args.json:
+    elif getattr(args, "auto_select", False):
+        if not getattr(args, "json", False):
             print("正在自动选择最近的服务器...", file=sys.stderr)
-        selected_server, selection_reason = select_best_server(servers, tags=args.tags)
+        tags = getattr(args, "tags", None)
+        selected_server, selection_reason, tag_matched = select_best_server(servers, tags=tags)
+        if not tag_matched:
+            error_msg = f"标签 {tags} 没有匹配到任何活跃服务器"
+        elif selected_server is None:
+            error_msg = "没有可用的活跃服务器"
         selection_method = "auto_select"
-        if not args.json:
-            print(f"已选择服务器: {selected_server['name']} (延迟: {selection_reason[0]['latency_ms']:.2f} ms)", file=sys.stderr)
+        if not getattr(args, "json", False) and selected_server:
+            print(f"已选择服务器: {selected_server['name']} (延迟: {selection_reason[0]['latency_ms']:.2f} ms, 权重: {selected_server.get('weight', 10)})", file=sys.stderr)
     else:
-        filtered = filter_servers_by_tags(servers, args.tags)
-        if filtered:
-            selected_server = filtered[0]
+        tags = getattr(args, "tags", None)
+        active = get_active_servers(servers)
+        if tags:
+            filtered, tag_matched = filter_servers_by_tags(active, tags)
+            if not tag_matched:
+                error_msg = f"标签 {tags} 没有匹配到任何活跃服务器"
+                selected_server = None
+            else:
+                selected_server = filtered[0]
         else:
-            selected_server = servers[0]
+            if active:
+                selected_server = active[0]
+            else:
+                error_msg = "没有可用的活跃服务器"
         selection_method = "default"
 
-    if not args.json:
-        print(f"测试服务器: {selected_server['name']}", file=sys.stderr)
-        if selected_server.get("region"):
-            print(f"地区: {selected_server.get('region')} - {selected_server.get('city', '')}", file=sys.stderr)
-        if selected_server.get("isp"):
-            print(f"运营商: {selected_server.get('isp')}", file=sys.stderr)
-        if selected_server.get("tags"):
-            print(f"标签: {', '.join(selected_server.get('tags', []))}", file=sys.stderr)
-        print(f"下载地址: {build_download_url(selected_server, args.download_size)}", file=sys.stderr)
-        if selected_server.get("upload_url") and not args.skip_upload:
-            print(f"上传地址: {selected_server.get('upload_url')}", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
+    return selected_server, selection_reason, selection_method, tag_matched, error_msg
 
-    while True:
-        result = run_test(
-            selected_server,
-            upload_size_mb=args.upload_size,
-            download_size_mb=args.download_size,
-            skip_upload=args.skip_upload,
-            selection_reason=selection_reason,
-            selection_method=selection_method
-        )
 
-        if args.output:
-            append_to_jsonl(args.output, result)
-            if not args.json:
-                print(f"结果已追加到: {args.output}", file=sys.stderr)
+def cmd_test(args):
+    try:
+        servers, load_error = resolve_servers(args)
+        if load_error:
+            output_error_json(load_error, "config_error")
 
-        if args.webhook:
-            success = send_to_webhook(args.webhook, result)
-            if not args.json:
-                if success:
-                    print("Webhook 推送成功", file=sys.stderr)
-                else:
-                    print("Webhook 推送失败", file=sys.stderr)
+        selected_server, selection_reason, selection_method, tag_matched, selection_error = resolve_server_selection(args, servers)
+        if selection_error or selected_server is None:
+            output_error_json(selection_error or "无法选择测试服务器", "server_selection_error", {
+                "tag_matched": tag_matched,
+                "tags_requested": getattr(args, "tags", None)
+            })
 
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        else:
+        if not getattr(args, "json", False):
+            print(f"测试服务器: {selected_server['name']}", file=sys.stderr)
+            if selected_server.get("region"):
+                print(f"地区: {selected_server.get('region')} - {selected_server.get('city', '')}", file=sys.stderr)
+            if selected_server.get("isp"):
+                print(f"运营商: {selected_server.get('isp')}", file=sys.stderr)
+            if selected_server.get("tags"):
+                print(f"标签: {', '.join(selected_server.get('tags', []))}", file=sys.stderr)
+            if selected_server.get("weight"):
+                print(f"权重: {selected_server.get('weight', 10)}", file=sys.stderr)
+            print(f"下载地址: {build_download_url(selected_server, getattr(args, 'download_size', None))}", file=sys.stderr)
+            if selected_server.get("upload_url") and not getattr(args, "skip_upload", False):
+                print(f"上传地址: {selected_server.get('upload_url')}", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
-            print(f"测试时间: {result['local_time']}", file=sys.stderr)
-            print(f"测试状态: {'成功' if result['test_success'] else '部分失败'}", file=sys.stderr)
-            print(f"下载大小: {result['test_config']['download_size_mb']} MB", file=sys.stderr)
-            download_status = f" (失败: {result['download'].get('error', '')})" if not result['download']['success'] else ""
-            print(f"下载速度: {result['download']['speed_mbps']:.2f} Mbps{download_status}", file=sys.stderr)
-            if not args.skip_upload:
-                print(f"上传大小: {result['test_config']['upload_size_mb']} MB", file=sys.stderr)
-                upload_status = f" (失败: {result['upload'].get('error', '')})" if not result['upload']['success'] else ""
-                print(f"上传速度: {result['upload']['speed_mbps']:.2f} Mbps{upload_status}", file=sys.stderr)
-            print(f"延迟: {result['latency']['avg_ms']:.2f} ms (min: {result['latency']['min_ms']:.2f}, max: {result['latency']['max_ms']:.2f}, 丢包: {result['latency']['packet_loss']}%)", file=sys.stderr)
-            if not result['latency']['success']:
-                print(f"延迟测试错误: {', '.join(result['latency']['errors'])}", file=sys.stderr)
-            print(f"网络质量: {result['quality_evaluation']['quality']}", file=sys.stderr)
-            print(f"建议: {result['quality_evaluation']['suggestion']}", file=sys.stderr)
 
-        if not args.continuous:
-            break
+        alert_rules = {}
+        if getattr(args, "alert_download_min", None) is not None:
+            alert_rules["download_min_mbps"] = args.alert_download_min
+        if getattr(args, "alert_latency_max", None) is not None:
+            alert_rules["latency_max_ms"] = args.alert_latency_max
+        if getattr(args, "alert_consecutive_fail", None) is not None:
+            alert_rules["consecutive_fail"] = args.alert_consecutive_fail
+        alert_rules["_recent_results"] = []
 
-        print(f"\n等待 {args.interval} 秒后进行下一次测试... (Ctrl+C 停止)", file=sys.stderr)
-        try:
-            time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\n测试已停止", file=sys.stderr)
-            break
+        consecutive_fail_count = 0
+
+        while True:
+            result = run_test(
+                selected_server,
+                upload_size_mb=getattr(args, "upload_size", 10),
+                download_size_mb=getattr(args, "download_size", None),
+                skip_upload=getattr(args, "skip_upload", False),
+                selection_reason=selection_reason,
+                selection_method=selection_method,
+                tag_matched=tag_matched
+            )
+
+            if alert_rules:
+                alert_result = check_alert_rules(result, alert_rules)
+                result["alert"] = alert_result
+                if alert_result["triggered"]:
+                    if not getattr(args, "json", False):
+                        for rule in alert_result["rules_triggered"]:
+                            print(f"⚠ 告警: {rule['message']}", file=sys.stderr)
+
+            if alert_rules.get("consecutive_fail") is not None:
+                if not result["test_success"]:
+                    consecutive_fail_count += 1
+                else:
+                    consecutive_fail_count = 0
+                alert_rules["_recent_results"] = alert_rules["_recent_results"][-9:] + [result]
+
+            if args.output:
+                append_to_jsonl(args.output, result)
+                if not getattr(args, "json", False):
+                    print(f"结果已追加到: {args.output}", file=sys.stderr)
+
+            if getattr(args, "webhook", None):
+                success = send_to_webhook(args.webhook, result)
+                if not getattr(args, "json", False):
+                    if success:
+                        print("Webhook 推送成功", file=sys.stderr)
+                    else:
+                        print("Webhook 推送失败", file=sys.stderr)
+
+            if getattr(args, "json", False):
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print("=" * 60, file=sys.stderr)
+                print(f"测试时间: {result['local_time']}", file=sys.stderr)
+                print(f"测试状态: {'成功' if result['test_success'] else '部分失败'}", file=sys.stderr)
+                if not tag_matched:
+                    print(f"⚠ 标签未匹配: 请求的标签 {getattr(args, 'tags', None)} 没有匹配到服务器", file=sys.stderr)
+                print(f"下载大小: {result['test_config']['download_size_mb']} MB", file=sys.stderr)
+                download_status = f" (失败: {result['download'].get('error', '')})" if not result['download']['success'] else ""
+                print(f"下载速度: {result['download']['speed_mbps']:.2f} Mbps{download_status}", file=sys.stderr)
+                if not getattr(args, "skip_upload", False):
+                    print(f"上传大小: {result['test_config']['upload_size_mb']} MB", file=sys.stderr)
+                    upload_status = f" (失败: {result['upload'].get('error', '')})" if not result['upload']['success'] else ""
+                    print(f"上传速度: {result['upload']['speed_mbps']:.2f} Mbps{upload_status}", file=sys.stderr)
+                print(f"延迟: {result['latency']['avg_ms']:.2f} ms (min: {result['latency']['min_ms']:.2f}, max: {result['latency']['max_ms']:.2f}, 丢包: {result['latency']['packet_loss']}%)", file=sys.stderr)
+                if not result['latency']['success']:
+                    print(f"延迟测试错误: {', '.join(result['latency']['errors'])}", file=sys.stderr)
+                print(f"网络质量: {result['quality_evaluation']['quality']}", file=sys.stderr)
+                print(f"建议: {result['quality_evaluation']['suggestion']}", file=sys.stderr)
+                if result['alert']['triggered']:
+                    print(f"告警状态: 已触发 ({len(result['alert']['rules_triggered'])} 条规则)", file=sys.stderr)
+                    for rule in result['alert']['rules_triggered']:
+                        print(f"  → {rule['message']}", file=sys.stderr)
+
+            if not getattr(args, "continuous", False):
+                break
+
+            print(f"\n等待 {getattr(args, 'interval', 600)} 秒后进行下一次测试... (Ctrl+C 停止)", file=sys.stderr)
+            try:
+                time.sleep(getattr(args, "interval", 600))
+            except KeyboardInterrupt:
+                print("\n测试已停止", file=sys.stderr)
+                break
+    except KeyboardInterrupt:
+        print("\n测试已中断", file=sys.stderr)
+    except Exception as e:
+        output_error_json(f"测试执行失败: {e}", "execution_error")
+
+
+def add_test_arguments(parser):
+    parser.add_argument("--download-url", type=str, help="指定下载测试文件URL")
+    parser.add_argument("--upload-url", type=str, help="指定上传测试URL")
+    parser.add_argument("--latency-url", type=str, help="指定延迟测试URL")
+    parser.add_argument("--server-name", type=str, default="Custom", help="指定服务器名称")
+    parser.add_argument("--download-size", type=int, help="下载测试文件大小(MB)，默认使用服务器配置")
+    parser.add_argument("--upload-size", type=int, default=10, help="上传测试文件大小(MB)，默认10MB")
+    parser.add_argument("--skip-upload", action="store_true", help="跳过上传测试")
+    parser.add_argument("--auto-select", action="store_true", help="自动选择最近的服务器")
+    parser.add_argument("--servers-file", type=str, help="自定义服务器列表JSON文件路径")
+    parser.add_argument("--tags", type=str, nargs="*", help="按标签筛选服务器，如: 电信 国内")
+    parser.add_argument("--continuous", action="store_true", help="启用连续测试模式")
+    parser.add_argument("--interval", type=int, default=600, help="连续测试间隔(秒)，默认600秒(10分钟)")
+    parser.add_argument("--output", type=str, help="JSONL输出文件路径，用于保存连续测试结果")
+    parser.add_argument("--webhook", type=str, help="测试结果Webhook推送地址")
+    parser.add_argument("--json", action="store_true", help="仅输出JSON格式结果")
+    parser.add_argument("--alert-download-min", type=float, help="告警：下载速度低于此值(Mbps)触发")
+    parser.add_argument("--alert-latency-max", type=float, help="告警：延迟高于此值(ms)触发")
+    parser.add_argument("--alert-consecutive-fail", type=int, help="告警：连续失败达到此次数触发")
 
 
 def main():
@@ -692,34 +1013,35 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
     test_parser = subparsers.add_parser("test", help="执行网速测试")
-    test_parser.add_argument("--download-url", type=str, help="指定下载测试文件URL")
-    test_parser.add_argument("--upload-url", type=str, help="指定上传测试URL")
-    test_parser.add_argument("--latency-url", type=str, help="指定延迟测试URL")
-    test_parser.add_argument("--server-name", type=str, default="Custom", help="指定服务器名称")
-    test_parser.add_argument("--download-size", type=int, help="下载测试文件大小(MB)，默认使用服务器配置")
-    test_parser.add_argument("--upload-size", type=int, default=10, help="上传测试文件大小(MB)，默认10MB")
-    test_parser.add_argument("--skip-upload", action="store_true", help="跳过上传测试")
-    test_parser.add_argument("--auto-select", action="store_true", help="自动选择最近的服务器")
-    test_parser.add_argument("--servers-file", type=str, help="自定义服务器列表JSON文件路径")
-    test_parser.add_argument("--tags", type=str, nargs="*", help="按标签筛选服务器，如: 电信 国内")
-    test_parser.add_argument("--continuous", action="store_true", help="启用连续测试模式")
-    test_parser.add_argument("--interval", type=int, default=600, help="连续测试间隔(秒)，默认600秒(10分钟)")
-    test_parser.add_argument("--output", type=str, help="JSONL输出文件路径，用于保存连续测试结果")
-    test_parser.add_argument("--webhook", type=str, help="测试结果Webhook推送地址")
-    test_parser.add_argument("--json", action="store_true", help="仅输出JSON格式结果")
+    add_test_arguments(test_parser)
 
     analyze_parser = subparsers.add_parser("analyze", help="分析历史JSONL数据")
     analyze_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
     analyze_parser.add_argument("--hours", type=int, default=0, help="统计最近N小时的数据，0表示全部数据")
 
-    args = parser.parse_args()
+    compare_parser = subparsers.add_parser("compare", help="对比两个时段的网络质量变化")
+    compare_parser.add_argument("--input", type=str, required=True, help="JSONL历史数据文件路径")
+    compare_parser.add_argument("--hours", type=int, default=1, help="对比时段长度(小时)，默认1小时(即最近1h vs 前1h)")
 
-    if args.command == "analyze":
-        cmd_analyze(args)
-    elif args.command == "test" or args.command is None:
-        cmd_test(args)
+    default_parser = argparse.ArgumentParser(description="网速测试工具 - 输出结构化JSON数据", add_help=False)
+    default_parser.add_argument("command", nargs="?", default=None)
+    add_test_arguments(default_parser)
+
+    first_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    subcommands = {"test", "analyze", "compare"}
+
+    if first_arg in subcommands:
+        args = parser.parse_args()
+        if args.command == "analyze":
+            cmd_analyze(args)
+        elif args.command == "compare":
+            cmd_compare(args)
+        else:
+            cmd_test(args)
     else:
-        parser.print_help()
+        default_args = default_parser.parse_args(sys.argv[1:])
+        default_args.command = "test"
+        cmd_test(default_args)
 
 
 if __name__ == "__main__":

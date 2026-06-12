@@ -8,6 +8,8 @@
       "city": "上海",
       "isp": "中国电信",
       "tags": ["电信", "国内", "公司内网"],
+      "weight": 15,
+      "disabled": false,
       "download_url": "http://speed.example.com/download",
       "download_size_param": "size",
       "default_download_size": 25,
@@ -21,6 +23,8 @@
       "city": "深圳",
       "isp": "中国联通",
       "tags": ["联通", "国内", "家庭"],
+      "weight": 10,
+      "disabled": false,
       "download_url": "http://192.168.1.100/testfile.bin",
       "download_size_param": null,
       "default_download_size": 0,
@@ -34,11 +38,28 @@
       "city": "Anycast",
       "isp": "Cloudflare",
       "tags": ["海外", "CDN", "全球"],
+      "weight": 5,
+      "disabled": false,
       "download_url": "https://speed.cloudflare.com/__down",
       "download_size_param": "bytes",
       "default_download_size": 25,
       "upload_url": "https://speed.cloudflare.com/__up",
       "latency_url": "https://speed.cloudflare.com/cdn-cgi/trace"
+    },
+    {
+      "id": "old-server",
+      "name": "已下线服务器",
+      "region": "华北",
+      "city": "北京",
+      "isp": "中国移动",
+      "tags": ["移动", "国内"],
+      "weight": 1,
+      "disabled": true,
+      "download_url": "http://old-server.example.com/download",
+      "download_size_param": "size",
+      "default_download_size": 10,
+      "upload_url": "http://old-server.example.com/upload",
+      "latency_url": "http://old-server.example.com/ping"
     }
   ]
 }
