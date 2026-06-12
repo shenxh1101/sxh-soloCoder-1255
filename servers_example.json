@@ -1,14 +1,44 @@
-[
-  {
-    "name": "我的测试服务器1",
-    "download_url": "http://example.com/download?size=25000000",
-    "upload_url": "http://example.com/upload",
-    "latency_url": "http://example.com/ping"
-  },
-  {
-    "name": "我的测试服务器2",
-    "download_url": "http://example2.com/testfile.bin",
-    "upload_url": "http://example2.com/upload",
-    "latency_url": "http://example2.com"
-  }
-]
+{
+  "description": "自定义服务器配置示例文件",
+  "servers": [
+    {
+      "id": "my-server-1",
+      "name": "公司测试服务器",
+      "region": "华东",
+      "city": "上海",
+      "isp": "中国电信",
+      "tags": ["电信", "国内", "公司内网"],
+      "download_url": "http://speed.example.com/download",
+      "download_size_param": "size",
+      "default_download_size": 25,
+      "upload_url": "http://speed.example.com/upload",
+      "latency_url": "http://speed.example.com/ping"
+    },
+    {
+      "id": "my-server-2",
+      "name": "家里的NAS测速",
+      "region": "华南",
+      "city": "深圳",
+      "isp": "中国联通",
+      "tags": ["联通", "国内", "家庭"],
+      "download_url": "http://192.168.1.100/testfile.bin",
+      "download_size_param": null,
+      "default_download_size": 0,
+      "upload_url": "http://192.168.1.100/upload",
+      "latency_url": "http://192.168.1.100"
+    },
+    {
+      "id": "cloudflare-cn",
+      "name": "Cloudflare 中国",
+      "region": "全球",
+      "city": "Anycast",
+      "isp": "Cloudflare",
+      "tags": ["海外", "CDN", "全球"],
+      "download_url": "https://speed.cloudflare.com/__down",
+      "download_size_param": "bytes",
+      "default_download_size": 25,
+      "upload_url": "https://speed.cloudflare.com/__up",
+      "latency_url": "https://speed.cloudflare.com/cdn-cgi/trace"
+    }
+  ]
+}
